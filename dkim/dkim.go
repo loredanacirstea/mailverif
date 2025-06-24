@@ -35,13 +35,6 @@ import (
 // If set, signatures for top-level domain "localhost" are accepted.
 var Localserve bool
 
-// var (
-// 	MetricSign   stub.CounterVec   = stub.CounterVecIgnore{}
-// 	MetricVerify stub.HistogramVec = stub.HistogramVecIgnore{}
-// )
-
-var timeNow = time.Now // Replaced during tests.
-
 // Status is the result of verifying a DKIM-Signature as described by RFC 8601,
 // "Message Header Field for Indicating Message Authentication Status".
 type Status string
@@ -97,7 +90,8 @@ type Result struct {
 	Sig             *Sig    // Parsed form of DKIM-Signature header. Can be nil for invalid DKIM-Signature header.
 	Record          *Record // Parsed form of DKIM DNS record for selector and domain in Sig. Optional.
 	RecordAuthentic bool    // Whether DKIM DNS record was DNSSEC-protected. Only valid if Sig is non-nil.
-	Err             error   // If Status is not StatusPass, this error holds the details and can be checked using errors.Is.
+	Expired         bool
+	Err             error // If Status is not StatusPass, this error holds the details and can be checked using errors.Is.
 }
 
 // todo: use some io.Writer to hash the body and the header.
@@ -123,7 +117,7 @@ type Selector struct {
 }
 
 // Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
-func Sign(elog *slog.Logger, localpart smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt) (headers string, rerr error) {
+func Sign(elog *slog.Logger, localpart smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, timeNow func() time.Time) (headers string, rerr error) {
 	defer func() {
 		elog.Debug("dkim sign result", rerr,
 			slog.Any("localpart", localpart),
@@ -158,10 +152,8 @@ func Sign(elog *slog.Logger, localpart smtp.Localpart, domain dns.Domain, select
 		switch sel.PrivateKey.(type) {
 		case *rsa.PrivateKey:
 			sig.AlgorithmSign = "rsa"
-			// MetricSign.IncLabels("rsa")
 		case ed25519.PrivateKey:
 			sig.AlgorithmSign = "ed25519"
-			// MetricSign.IncLabels("ed25519")
 		default:
 			return "", fmt.Errorf("internal error, unknown pivate key %T", sel.PrivateKey)
 		}
@@ -344,7 +336,7 @@ func Lookup(elog *slog.Logger, resolver dns.Resolver, selector, domain dns.Domai
 // verification failure is treated as actual failure. With ignoreTestMode
 // false, such verification failures are treated as if there is no signature by
 // returning StatusNone.
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTestMode bool) (results []Result, rerr error) {
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTestMode bool, strictExpiration bool, timeNow func() time.Time, record *Record) (results []Result, rerr error) {
 	defer func() {
 		if len(results) == 0 {
 			elog.Debug("dkim verify result", rerr, slog.Bool("smtputf8", smtputf8))
@@ -374,33 +366,34 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func
 		if err != nil {
 			// ../rfc/6376:2503
 			err := fmt.Errorf("parsing DKIM-Signature header: %w", err)
-			results = append(results, Result{StatusPermerror, nil, nil, false, err})
+			results = append(results, Result{StatusPermerror, nil, nil, false, false, err})
 			continue
 		}
 
-		h, canonHeaderSimple, canonDataSimple, err := checkSignatureParams(elog, sig)
+		h, canonHeaderSimple, canonDataSimple, expired, err := checkSignatureParams(elog, sig, strictExpiration, timeNow)
 		if err != nil {
-			results = append(results, Result{StatusPermerror, sig, nil, false, err})
+			results = append(results, Result{StatusPermerror, sig, nil, false, expired, err})
 			continue
 		}
 
 		// ../rfc/6376:2560
 		if err := policy(sig); err != nil {
 			err := fmt.Errorf("%w: %s", ErrPolicy, err)
-			results = append(results, Result{StatusPolicy, sig, nil, false, err})
+			results = append(results, Result{StatusPolicy, sig, nil, false, expired, err})
 			continue
 		}
 
 		br := bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)})
-		status, txt, authentic, err := verifySignature(elog, resolver, sig, h, canonHeaderSimple, canonDataSimple, hdrs, verifySig, br, ignoreTestMode)
-		results = append(results, Result{status, sig, txt, authentic, err})
+		status, txt, authentic, err := verifySignature(elog, resolver, sig, h, canonHeaderSimple, canonDataSimple, hdrs, verifySig, br, ignoreTestMode, record)
+		results = append(results, Result{status, sig, txt, authentic, expired, err})
 	}
 	return results, nil
 }
 
 // check if signature is acceptable.
 // Only looks at the signature parameters, not at the DNS record.
-func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonHeaderSimple, canonBodySimple bool, rerr error) {
+func checkSignatureParams(elog *slog.Logger, sig *Sig, strictExpiration bool, timeNow func() time.Time) (hash crypto.Hash, canonHeaderSimple, canonBodySimple bool, expired bool, rerr error) {
+	expired = false
 	// "From" header is required, ../rfc/6376:2122 ../rfc/6376:2546
 	var from bool
 	for _, h := range sig.SignedHeaders {
@@ -410,12 +403,15 @@ func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonH
 		}
 	}
 	if !from {
-		return 0, false, false, fmt.Errorf(`%w: required "from" header not signed`, ErrFrom)
+		return 0, false, false, expired, fmt.Errorf(`%w: required "from" header not signed`, ErrFrom)
 	}
 
 	// ../rfc/6376:2550
 	if sig.ExpireTime >= 0 && sig.ExpireTime < timeNow().Unix() {
-		return 0, false, false, fmt.Errorf("%w: expiration time %q", ErrSigExpired, time.Unix(sig.ExpireTime, 0).Format(time.RFC3339))
+		expired = true
+		if strictExpiration {
+			return 0, false, false, expired, fmt.Errorf("%w: expiration time %q", ErrSigExpired, time.Unix(sig.ExpireTime, 0).Format(time.RFC3339))
+		}
 	}
 
 	// ../rfc/6376:2554
@@ -430,12 +426,12 @@ func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonH
 		subdom.Unicode = "x." + subdom.Unicode
 	}
 	if orgDom := publicsuffix.Lookup(elog, subdom); subdom.ASCII == orgDom.ASCII && !(Localserve && sig.Domain.ASCII == "localhost") {
-		return 0, false, false, fmt.Errorf("%w: %s", ErrTLD, sig.Domain)
+		return 0, false, false, expired, fmt.Errorf("%w: %s", ErrTLD, sig.Domain)
 	}
 
 	h, hok := algHash(sig.AlgorithmHash)
 	if !hok {
-		return 0, false, false, fmt.Errorf("%w: %q", ErrHashAlgorithmUnknown, sig.AlgorithmHash)
+		return 0, false, false, expired, fmt.Errorf("%w: %q", ErrHashAlgorithmUnknown, sig.AlgorithmHash)
 	}
 
 	t := strings.SplitN(sig.Canonicalization, "/", 2)
@@ -445,7 +441,7 @@ func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonH
 		canonHeaderSimple = true
 	case "relaxed":
 	default:
-		return 0, false, false, fmt.Errorf("%w: header canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
+		return 0, false, false, expired, fmt.Errorf("%w: header canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
 	}
 
 	canon := "simple"
@@ -457,7 +453,7 @@ func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonH
 		canonBodySimple = true
 	case "relaxed":
 	default:
-		return 0, false, false, fmt.Errorf("%w: body canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
+		return 0, false, false, expired, fmt.Errorf("%w: body canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
 	}
 
 	// We only recognize query method dns/txt, which is the default. ../rfc/6376:1268
@@ -470,20 +466,25 @@ func checkSignatureParams(elog *slog.Logger, sig *Sig) (hash crypto.Hash, canonH
 			}
 		}
 		if !dnstxt {
-			return 0, false, false, fmt.Errorf("%w: need dns/txt", ErrQueryMethod)
+			return 0, false, false, expired, fmt.Errorf("%w: need dns/txt", ErrQueryMethod)
 		}
 	}
 
-	return h, canonHeaderSimple, canonBodySimple, nil
+	return h, canonHeaderSimple, canonBodySimple, expired, nil
 }
 
 // lookup the public key in the DNS and verify the signature.
-func verifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool) (Status, *Record, bool, error) {
-	// ../rfc/6376:2604
-	status, record, _, authentic, err := Lookup(elog, resolver, sig.Selector, sig.Domain)
-	if err != nil {
-		// todo: for temporary errors, we could pass on information so caller returns a 4.7.5 ecode, ../rfc/6376:2777
-		return status, nil, authentic, err
+func verifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool, record *Record) (Status, *Record, bool, error) {
+	var status Status
+	var err error
+	var authentic bool = false
+	if record == nil {
+		// ../rfc/6376:2604
+		status, record, _, authentic, err = Lookup(elog, resolver, sig.Selector, sig.Domain)
+		if err != nil {
+			// todo: for temporary errors, we could pass on information so caller returns a 4.7.5 ecode, ../rfc/6376:2777
+			return status, nil, authentic, err
+		}
 	}
 	status, err = verifySignatureRecord(record, sig, hash, canonHeaderSimple, canonDataSimple, hdrs, verifySig, body, ignoreTestMode)
 	return status, record, authentic, err
