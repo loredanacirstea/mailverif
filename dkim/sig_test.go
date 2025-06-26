@@ -20,7 +20,7 @@ func TestSig(t *testing.T) {
 			return ok
 		}
 
-		sig, _, err := parseSignature([]byte(s), smtputf8)
+		sig, _, err := ParseSignature([]byte(s), DKIMSpec.HeaderName, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) && !(isParseErr(err) && isParseErr(expErr)) {
 			t.Fatalf("got err %v, expected %v", err, expErr)
 		}
@@ -35,7 +35,7 @@ func TestSig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("making signature header: %v", err)
 		}
-		nsig, _, err := parseSignature([]byte(h), smtputf8)
+		nsig, _, err := ParseSignature([]byte(h), DKIM_SIGNATURE_HEADER, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 		if err != nil {
 			t.Fatalf("parse signature again: %v", err)
 		}
@@ -64,6 +64,7 @@ func TestSig(t *testing.T) {
 
 	var empty smtp.Localpart
 	sig1 := &Sig{
+		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -84,6 +85,7 @@ func TestSig(t *testing.T) {
 
 	ulp := smtp.Localpart("møx")
 	sig2 := &Sig{
+		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -103,6 +105,7 @@ func TestSig(t *testing.T) {
 
 	multiatom := smtp.Localpart("a.b.c")
 	sig3 := &Sig{
+		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -121,6 +124,7 @@ func TestSig(t *testing.T) {
 
 	quotedlp := smtp.Localpart(`test "\test`)
 	sig4 := &Sig{
+		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -164,7 +168,7 @@ func TestCopiedHeadersSig(t *testing.T) {
 	b=dzdVyOfAKCdLXdJOc9G2q8LoXSlEniSbav+yuU4zGeeruD00lszZVoG4ZHRNiYzR
 `, "\n", "\r\n")
 
-	sig, _, err := parseSignature([]byte(sigHeader), false)
+	sig, _, err := ParseSignature([]byte(sigHeader), DKIMSpec.HeaderName, false, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 	if err != nil {
 		t.Fatalf("parsing dkim signature with copied headers: %v", err)
 	}

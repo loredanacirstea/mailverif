@@ -174,5 +174,6 @@ func IsNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), errNoSuchHost) || strings.Contains(err.Error(), errUnknownPort)
+	errmsg := err.Error()
+	return strings.Contains(errmsg, errNoSuchHost) || strings.Contains(errmsg, errUnknownPort) || strings.Contains(errmsg, "no record")
 }

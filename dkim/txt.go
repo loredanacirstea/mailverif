@@ -151,7 +151,7 @@ func ParseRecord(s string) (record *Record, isdkim bool, err error) {
 		Services: []string{"*"},
 	}
 
-	p := parser{s: s, drop: true}
+	p := Parser{s: s, drop: true}
 	seen := map[string]struct{}{}
 	// ../rfc/6376:655
 	// ../rfc/6376:656 ../rfc/6376-eid5070

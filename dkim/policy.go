@@ -3,6 +3,8 @@ package dkim
 import (
 	"fmt"
 	"strings"
+
+	"github.com/loredanacirstea/mailverif/utils"
 )
 
 // DefaultPolicy is the default DKIM policy.
@@ -45,5 +47,40 @@ func DefaultPolicy(sig *Sig) error {
 		return fmt.Errorf("required header fields missing from signature: %s", strings.Join(missing, ", "))
 	}
 
+	if sig.Version != 1 {
+		return fmt.Errorf("%w: version %d", errSigUnknownVersion, sig.Version)
+	}
+
 	return nil
+}
+
+func DefaultHeadersPolicy(hdrs []utils.Header) error {
+	nfrom := 0
+	for _, h := range hdrs {
+		if h.LKey == "from" {
+			nfrom++
+		}
+	}
+	if nfrom != 1 {
+		return fmt.Errorf("%w: message has %d from headers, need exactly 1", ErrFrom, nfrom)
+	}
+	return nil
+}
+
+func DefaultParsingPolicy(ds *Sig, p *Parser, fieldName string) (bool, error) {
+	switch fieldName {
+	case "v":
+		// ../rfc/6376:1025
+		ds.Version = int(p.XNumber(10))
+		if ds.Version != 1 {
+			return true, fmt.Errorf("%w: version %d", errSigUnknownVersion, ds.Version)
+		}
+		return true, nil
+	case "i":
+		// ../rfc/6376:1171
+		id := p.xauid()
+		ds.Identity = &id
+		return true, nil
+	}
+	return false, nil
 }

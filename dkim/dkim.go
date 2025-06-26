@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ed25519"
-	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"errors"
 	"fmt"
@@ -24,12 +23,10 @@ import (
 	"strings"
 	"time"
 
-	"slices"
-
 	"github.com/loredanacirstea/mailverif/dns"
-	"github.com/loredanacirstea/mailverif/publicsuffix"
 	moxio "github.com/loredanacirstea/mailverif/utils"
 	smtp "github.com/loredanacirstea/mailverif/utils"
+	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
 // If set, signatures for top-level domain "localhost" are accepted.
@@ -80,6 +77,22 @@ var (
 	ErrWeakKey                 = errors.New("dkim: key is too weak, need at least 1024 bits for rsa")
 )
 
+const DKIM_SIGNATURE_HEADER = "DKIM-Signature"
+const DKIM_SIGNATURE_HEADER_LOW = "dkim-signature"
+
+// Pre‑declared DKIM spec (public so callers may copy & tweak for ARC).
+var DKIMSpec = Spec{
+	HeaderName: "DKIM-Signature",
+	// ../rfc/6376:2532
+	RequiredTags:         []string{"v", "a", "b", "bh", "d", "h", "s"},
+	CanonicalizationDef:  "simple/simple",
+	PolicySig:            DefaultPolicy,
+	PolicyHeader:         DefaultHeadersPolicy,
+	PolicyParsing:        DefaultParsingPolicy,
+	CheckSignatureParams: CheckSignatureParamsDKIM,
+	NewSigWithDefaults:   NewDKIMSigWithDefaults,
+}
+
 // Result is the conclusion of verifying one DKIM-Signature header. An email can
 // have multiple signatures, each with different parameters.
 //
@@ -116,144 +129,71 @@ type Selector struct {
 	Domain     dns.Domain    // Of selector only, not FQDN.
 }
 
+func NewDKIMSigWithDefaults() *Sig {
+	return &Sig{
+		HeaderName:       DKIM_SIGNATURE_HEADER,
+		Canonicalization: "simple/simple",
+		Length:           -1,
+		SignTime:         -1,
+		ExpireTime:       -1,
+		Version:          1,
+	}
+}
+
 // Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
-func Sign(elog *slog.Logger, localpart smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, timeNow func() time.Time) (headers string, rerr error) {
-	defer func() {
-		elog.Debug("dkim sign result", rerr,
-			slog.Any("localpart", localpart),
-			slog.Any("domain", domain),
-			slog.Bool("smtputf8", smtputf8))
-	}()
+func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, now func() time.Time) ([]string, error) {
 
-	hdrs, bodyOffset, err := parseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
-	}
-	nfrom := 0
-	for _, h := range hdrs {
-		if h.lkey == "from" {
-			nfrom++
-		}
-	}
-	if nfrom != 1 {
-		return "", fmt.Errorf("%w: message has %d from headers, need exactly 1", ErrFrom, nfrom)
+		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
 	}
 
-	type hashKey struct {
-		simple bool   // Canonicalization.
-		hash   string // lower-case hash.
+	sigs, err := BuildSignatureGeneric(elog, DKIMSpec, hdrs, bodyOffset, domain, selectors, smtputf8, msg, now)
+	if err != nil {
+		return nil, err
 	}
-
-	var bodyHashes = map[hashKey][]byte{}
-
-	for _, sel := range selectors {
-		sig := newSigWithDefaults()
-		sig.Version = 1
-		switch sel.PrivateKey.(type) {
-		case *rsa.PrivateKey:
-			sig.AlgorithmSign = "rsa"
-		case ed25519.PrivateKey:
-			sig.AlgorithmSign = "ed25519"
-		default:
-			return "", fmt.Errorf("internal error, unknown pivate key %T", sel.PrivateKey)
-		}
-		sig.AlgorithmHash = sel.Hash
-		sig.Domain = domain
-		sig.Selector = sel.Domain
-		sig.Identity = &Identity{&localpart, domain}
-		sig.SignedHeaders = slices.Clone(sel.Headers)
-		if sel.SealHeaders {
-			// ../rfc/6376:2156
-			// Each time a header name is added to the signature, the next unused value is
-			// signed (in reverse order as they occur in the message). So we can add each
-			// header name as often as it occurs. But now we'll add the header names one
-			// additional time, preventing someone from adding one more header later on.
-			counts := map[string]int{}
-			for _, h := range hdrs {
-				counts[h.lkey]++
-			}
-			for _, h := range sel.Headers {
-				for j := counts[strings.ToLower(h)]; j > 0; j-- {
-					sig.SignedHeaders = append(sig.SignedHeaders, h)
-				}
-			}
-		}
-		sig.SignTime = timeNow().Unix()
-		if sel.Expiration > 0 {
-			sig.ExpireTime = sig.SignTime + int64(sel.Expiration/time.Second)
-		}
-
-		sig.Canonicalization = "simple"
-		if sel.HeaderRelaxed {
-			sig.Canonicalization = "relaxed"
-		}
-		sig.Canonicalization += "/"
-		if sel.BodyRelaxed {
-			sig.Canonicalization += "relaxed"
-		} else {
-			sig.Canonicalization += "simple"
-		}
-
-		h, hok := algHash(sig.AlgorithmHash)
-		if !hok {
-			return "", fmt.Errorf("unrecognized hash algorithm %q", sig.AlgorithmHash)
-		}
-
-		// We must now first calculate the hash over the body. Then include that hash in a
-		// new DKIM-Signature header. Then hash that and the signed headers into a data
-		// hash. Then that hash is finally signed and the signature included in the new
-		// DKIM-Signature header.
-		// ../rfc/6376:1700
-
-		hk := hashKey{!sel.BodyRelaxed, strings.ToLower(sig.AlgorithmHash)}
-		if bh, ok := bodyHashes[hk]; ok {
-			sig.BodyHash = bh
-		} else {
-			br := bufio.NewReader(&moxio.AtReader{R: msg, Offset: int64(bodyOffset)})
-			bh, err = bodyHash(h.New(), !sel.BodyRelaxed, br)
-			if err != nil {
-				return "", err
-			}
-			sig.BodyHash = bh
-			bodyHashes[hk] = bh
-		}
-
-		sigh, err := sig.Header()
-		if err != nil {
-			return "", err
-		}
-		verifySig := []byte(strings.TrimSuffix(sigh, "\r\n"))
-
-		dh, err := dataHash(h.New(), !sel.HeaderRelaxed, sig, hdrs, verifySig)
-		if err != nil {
-			return "", err
-		}
-
-		switch key := sel.PrivateKey.(type) {
-		case *rsa.PrivateKey:
-			sig.Signature, err = key.Sign(cryptorand.Reader, dh, h)
-			if err != nil {
-				return "", fmt.Errorf("signing data: %v", err)
-			}
-		case ed25519.PrivateKey:
-			// crypto.Hash(0) indicates data isn't prehashed (ed25519ph). We are using
-			// PureEdDSA to sign the sha256 hash. ../rfc/8463:123 ../rfc/8032:427
-			sig.Signature, err = key.Sign(cryptorand.Reader, dh, crypto.Hash(0))
-			if err != nil {
-				return "", fmt.Errorf("signing data: %v", err)
-			}
-		default:
-			return "", fmt.Errorf("unsupported private key type: %s", err)
-		}
-
-		sigh, err = sig.Header()
-		if err != nil {
-			return "", err
-		}
-		headers += sigh
+	for _, sig := range sigs {
+		sig.Identity = &Identity{&local, domain}
 	}
+	return SignGeneric(sigs, hdrs)
+}
 
-	return headers, nil
+// Verify parses the DKIM-Signature headers in a message and verifies each of them.
+//
+// If the headers of the message cannot be found, an error is returned.
+// Otherwise, each DKIM-Signature header is reflected in the returned results.
+//
+// NOTE: Verify does not check if the domain (d=) that signed the message is
+// the domain of the sender. The caller, e.g. through DMARC, should do this.
+//
+// If ignoreTestMode is true and the DKIM record is in test mode (t=y), a
+// verification failure is treated as actual failure. With ignoreTestMode
+// false, such verification failures are treated as if there is no signature by
+// returning StatusNone.
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *Record) ([]Result, error) {
+	// allow custom policy override while still using DKIMSpec.
+	spec := DKIMSpec
+	if policy != nil {
+		spec.PolicySig = policy
+	}
+	return VerifyGeneric(elog, spec, resolver, smtputf8, r, ignoreTest, strictExpiration, now, rec)
+}
+
+// check if signature is acceptable.
+// Only looks at the signature parameters, not at the DNS record.
+func CheckSignatureParamsDKIM(sig *Sig) error {
+	// "From" header is required, ../rfc/6376:2122 ../rfc/6376:2546
+	var from bool
+	for _, h := range sig.SignedHeaders {
+		if strings.EqualFold(h, "from") {
+			from = true
+			break
+		}
+	}
+	if !from {
+		return fmt.Errorf(`%w: required "from" header not signed`, ErrFrom)
+	}
+	return nil
 }
 
 // Lookup looks up the DKIM TXT record and parses it.
@@ -324,157 +264,8 @@ func Lookup(elog *slog.Logger, resolver dns.Resolver, selector, domain dns.Domai
 	return StatusNeutral, record, txt, lookupResult.Authentic, nil
 }
 
-// Verify parses the DKIM-Signature headers in a message and verifies each of them.
-//
-// If the headers of the message cannot be found, an error is returned.
-// Otherwise, each DKIM-Signature header is reflected in the returned results.
-//
-// NOTE: Verify does not check if the domain (d=) that signed the message is
-// the domain of the sender. The caller, e.g. through DMARC, should do this.
-//
-// If ignoreTestMode is true and the DKIM record is in test mode (t=y), a
-// verification failure is treated as actual failure. With ignoreTestMode
-// false, such verification failures are treated as if there is no signature by
-// returning StatusNone.
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTestMode bool, strictExpiration bool, timeNow func() time.Time, record *Record) (results []Result, rerr error) {
-	defer func() {
-		if len(results) == 0 {
-			elog.Debug("dkim verify result", rerr, slog.Bool("smtputf8", smtputf8))
-		}
-		for _, result := range results {
-			elog.Debug("dkim verify result", result.Err,
-				slog.Bool("smtputf8", smtputf8),
-				slog.Any("status", result.Status),
-				slog.Any("sig", result.Sig),
-				slog.Any("record", result.Record))
-		}
-	}()
-
-	hdrs, bodyOffset, err := parseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
-	}
-
-	// todo: reuse body hashes and possibly verify signatures in parallel. and start the dns lookup immediately. ../rfc/6376:2697
-
-	for _, h := range hdrs {
-		if h.lkey != "dkim-signature" {
-			continue
-		}
-
-		sig, verifySig, err := parseSignature(h.raw, smtputf8)
-		if err != nil {
-			// ../rfc/6376:2503
-			err := fmt.Errorf("parsing DKIM-Signature header: %w", err)
-			results = append(results, Result{StatusPermerror, nil, nil, false, false, err})
-			continue
-		}
-
-		h, canonHeaderSimple, canonDataSimple, expired, err := checkSignatureParams(elog, sig, strictExpiration, timeNow)
-		if err != nil {
-			results = append(results, Result{StatusPermerror, sig, nil, false, expired, err})
-			continue
-		}
-
-		// ../rfc/6376:2560
-		if err := policy(sig); err != nil {
-			err := fmt.Errorf("%w: %s", ErrPolicy, err)
-			results = append(results, Result{StatusPolicy, sig, nil, false, expired, err})
-			continue
-		}
-
-		br := bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)})
-		status, txt, authentic, err := verifySignature(elog, resolver, sig, h, canonHeaderSimple, canonDataSimple, hdrs, verifySig, br, ignoreTestMode, record)
-		results = append(results, Result{status, sig, txt, authentic, expired, err})
-	}
-	return results, nil
-}
-
-// check if signature is acceptable.
-// Only looks at the signature parameters, not at the DNS record.
-func checkSignatureParams(elog *slog.Logger, sig *Sig, strictExpiration bool, timeNow func() time.Time) (hash crypto.Hash, canonHeaderSimple, canonBodySimple bool, expired bool, rerr error) {
-	expired = false
-	// "From" header is required, ../rfc/6376:2122 ../rfc/6376:2546
-	var from bool
-	for _, h := range sig.SignedHeaders {
-		if strings.EqualFold(h, "from") {
-			from = true
-			break
-		}
-	}
-	if !from {
-		return 0, false, false, expired, fmt.Errorf(`%w: required "from" header not signed`, ErrFrom)
-	}
-
-	// ../rfc/6376:2550
-	if sig.ExpireTime >= 0 && sig.ExpireTime < timeNow().Unix() {
-		expired = true
-		if strictExpiration {
-			return 0, false, false, expired, fmt.Errorf("%w: expiration time %q", ErrSigExpired, time.Unix(sig.ExpireTime, 0).Format(time.RFC3339))
-		}
-	}
-
-	// ../rfc/6376:2554
-	// ../rfc/6376:3284
-	// Refuse signatures that reach beyond declared scope. We use the existing
-	// publicsuffix.Lookup to lookup a fake subdomain of the signing domain. If this
-	// supposed subdomain is actually an organizational domain, the signing domain
-	// shouldn't be signing for its organizational domain.
-	subdom := sig.Domain
-	subdom.ASCII = "x." + subdom.ASCII
-	if subdom.Unicode != "" {
-		subdom.Unicode = "x." + subdom.Unicode
-	}
-	if orgDom := publicsuffix.Lookup(elog, subdom); subdom.ASCII == orgDom.ASCII && !(Localserve && sig.Domain.ASCII == "localhost") {
-		return 0, false, false, expired, fmt.Errorf("%w: %s", ErrTLD, sig.Domain)
-	}
-
-	h, hok := algHash(sig.AlgorithmHash)
-	if !hok {
-		return 0, false, false, expired, fmt.Errorf("%w: %q", ErrHashAlgorithmUnknown, sig.AlgorithmHash)
-	}
-
-	t := strings.SplitN(sig.Canonicalization, "/", 2)
-
-	switch strings.ToLower(t[0]) {
-	case "simple":
-		canonHeaderSimple = true
-	case "relaxed":
-	default:
-		return 0, false, false, expired, fmt.Errorf("%w: header canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
-	}
-
-	canon := "simple"
-	if len(t) == 2 {
-		canon = t[1]
-	}
-	switch strings.ToLower(canon) {
-	case "simple":
-		canonBodySimple = true
-	case "relaxed":
-	default:
-		return 0, false, false, expired, fmt.Errorf("%w: body canonicalization %q", ErrCanonicalizationUnknown, sig.Canonicalization)
-	}
-
-	// We only recognize query method dns/txt, which is the default. ../rfc/6376:1268
-	if len(sig.QueryMethods) > 0 {
-		var dnstxt bool
-		for _, m := range sig.QueryMethods {
-			if strings.EqualFold(m, "dns/txt") {
-				dnstxt = true
-				break
-			}
-		}
-		if !dnstxt {
-			return 0, false, false, expired, fmt.Errorf("%w: need dns/txt", ErrQueryMethod)
-		}
-	}
-
-	return h, canonHeaderSimple, canonBodySimple, expired, nil
-}
-
 // lookup the public key in the DNS and verify the signature.
-func verifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool, record *Record) (Status, *Record, bool, error) {
+func VerifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool, record *Record) (Status, *Record, bool, error) {
 	var status Status
 	var err error
 	var authentic bool = false
@@ -486,12 +277,12 @@ func verifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash cr
 			return status, nil, authentic, err
 		}
 	}
-	status, err = verifySignatureRecord(record, sig, hash, canonHeaderSimple, canonDataSimple, hdrs, verifySig, body, ignoreTestMode)
+	status, err = VerifySignatureRecord(record, sig, hash, canonHeaderSimple, canonDataSimple, hdrs, verifySig, body, ignoreTestMode)
 	return status, record, authentic, err
 }
 
 // verify a DKIM signature given the record from dns and signature from the email message.
-func verifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool) (rstatus Status, rerr error) {
+func VerifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool) (rstatus Status, rerr error) {
 	if !ignoreTestMode {
 		// ../rfc/6376:1558
 		y := false
@@ -562,7 +353,7 @@ func verifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSim
 	// ../rfc/6376:1700
 	// ../rfc/6376:2656
 
-	dh, err := dataHash(hash.New(), canonHeaderSimple, sig, hdrs, verifySig)
+	dh, err := DataHash(hash.New(), canonHeaderSimple, sig, hdrs, verifySig)
 	if err != nil {
 		// Any error is likely an invalid header field in the message, hence permanent error.
 		return StatusPermerror, fmt.Errorf("calculating data hash: %w", err)
@@ -581,7 +372,7 @@ func verifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSim
 		return StatusPermerror, fmt.Errorf("%w: unrecognized signature algorithm %q", ErrSigAlgorithmUnknown, r.Key)
 	}
 
-	bh, err := bodyHash(hash.New(), canonDataSimple, body)
+	bh, err := BodyHash(hash.New(), canonDataSimple, body)
 	if err != nil {
 		// Any error is likely some internal error, hence temporary error.
 		return StatusTemperror, fmt.Errorf("calculating body hash: %w", err)
@@ -603,7 +394,7 @@ func algHash(s string) (crypto.Hash, bool) {
 }
 
 // bodyHash calculates the hash over the body.
-func bodyHash(h hash.Hash, canonSimple bool, body *bufio.Reader) ([]byte, error) {
+func BodyHash(h hash.Hash, canonSimple bool, body *bufio.Reader) ([]byte, error) {
 	// todo: take l= into account. we don't currently allow it for policy reasons.
 
 	var crlf = []byte("\r\n")
@@ -703,11 +494,11 @@ func bodyHash(h hash.Hash, canonSimple bool, body *bufio.Reader) ([]byte, error)
 	return h.Sum(nil), nil
 }
 
-func dataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []header, verifySig []byte) ([]byte, error) {
+func DataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []utils.Header, verifySig []byte) ([]byte, error) {
 	headers := ""
-	revHdrs := map[string][]header{}
+	revHdrs := map[string][]utils.Header{}
 	for _, h := range hdrs {
-		revHdrs[h.lkey] = append([]header{h}, revHdrs[h.lkey]...)
+		revHdrs[h.LKey] = append([]utils.Header{h}, revHdrs[h.LKey]...)
 	}
 
 	for _, key := range sig.SignedHeaders {
@@ -717,7 +508,7 @@ func dataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []header, verifySig 
 			continue
 		}
 		revHdrs[lkey] = h[1:]
-		s := string(h[0].raw)
+		s := string(h[0].Raw)
 		if canonSimple {
 			// ../rfc/6376:823
 			// Add unmodified.
@@ -773,79 +564,4 @@ func relaxedCanonicalHeaderWithoutCRLF(s string) (string, error) {
 
 	ch := strings.ToLower(strings.TrimRight(t[0], " \t")) + ":" + strings.Trim(string(nv), " \t")
 	return ch, nil
-}
-
-type header struct {
-	key   string // Key in original case.
-	lkey  string // Key in lower-case, for canonical case.
-	value []byte // Literal header value, possibly spanning multiple lines, not modified in any way, including crlf, excluding leading key and colon.
-	raw   []byte // Like value, but including original leading key and colon. Ready for use as simple header canonicalized use.
-}
-
-func parseHeaders(br *bufio.Reader) ([]header, int, error) {
-	var o int
-	var l []header
-	var key, lkey string
-	var value []byte
-	var raw []byte
-	for {
-		line, err := readline(br)
-		if err != nil {
-			return nil, 0, err
-		}
-		o += len(line)
-		if bytes.Equal(line, []byte("\r\n")) {
-			break
-		}
-		if line[0] == ' ' || line[0] == '\t' {
-			if len(l) == 0 && key == "" {
-				return nil, 0, fmt.Errorf("malformed message, starts with space/tab")
-			}
-			value = append(value, line...)
-			raw = append(raw, line...)
-			continue
-		}
-		if key != "" {
-			l = append(l, header{key, lkey, value, raw})
-		}
-		t := bytes.SplitN(line, []byte(":"), 2)
-		if len(t) != 2 {
-			return nil, 0, fmt.Errorf("malformed message, header without colon")
-		}
-
-		key = strings.TrimRight(string(t[0]), " \t") // todo: where is this specified?
-		// Check for valid characters. ../rfc/5322:1689 ../rfc/6532:193
-		for _, c := range key {
-			if c <= ' ' || c >= 0x7f {
-				return nil, 0, fmt.Errorf("invalid header field name")
-			}
-		}
-		if key == "" {
-			return nil, 0, fmt.Errorf("empty header key")
-		}
-		lkey = strings.ToLower(key)
-		value = slices.Clone(t[1])
-		raw = slices.Clone(line)
-	}
-	if key != "" {
-		l = append(l, header{key, lkey, value, raw})
-	}
-	return l, o, nil
-}
-
-func readline(r *bufio.Reader) ([]byte, error) {
-	var buf []byte
-	for {
-		line, err := r.ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		if bytes.HasSuffix(line, []byte("\r\n")) {
-			if len(buf) == 0 {
-				return line, nil
-			}
-			return append(buf, line...), nil
-		}
-		buf = append(buf, line...)
-	}
 }
