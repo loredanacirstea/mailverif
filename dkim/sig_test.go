@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/loredanacirstea/mailverif/dns"
+	"github.com/loredanacirstea/mailverif/utils"
 	smtp "github.com/loredanacirstea/mailverif/utils"
 )
 
@@ -20,9 +21,16 @@ func TestSig(t *testing.T) {
 			return ok
 		}
 
-		sig, _, err := ParseSignature([]byte(s), DKIMSpec.HeaderName, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
+		sig, err := ParseSignature(&utils.Header{Key: DKIM_SIGNATURE_HEADER, Raw: []byte(s)}, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) && !(isParseErr(err) && isParseErr(expErr)) {
 			t.Fatalf("got err %v, expected %v", err, expErr)
+		}
+		// remove extras
+		var cacheh *utils.Header
+		if sig != nil {
+			cacheh = sig.HeaderFull
+			sig.HeaderFull = nil
+			sig.VerifySig = nil
 		}
 		if !reflect.DeepEqual(sig, expSig) {
 			t.Fatalf("got sig %#v, expected %#v", sig, expSig)
@@ -31,13 +39,21 @@ func TestSig(t *testing.T) {
 		if sig == nil {
 			return
 		}
+		sig.HeaderFull = cacheh
 		h, err := sig.Header()
 		if err != nil {
 			t.Fatalf("making signature header: %v", err)
 		}
-		nsig, _, err := ParseSignature([]byte(h), DKIM_SIGNATURE_HEADER, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
+		nsig, err := ParseSignature(&utils.Header{Key: DKIM_SIGNATURE_HEADER, Raw: []byte(h)}, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 		if err != nil {
 			t.Fatalf("parse signature again: %v", err)
+		}
+		// remove extras
+		sig.HeaderFull = nil
+		sig.VerifySig = nil
+		if nsig != nil {
+			nsig.HeaderFull = nil
+			nsig.VerifySig = nil
 		}
 		if !reflect.DeepEqual(nsig, sig) {
 			t.Fatalf("parsed signature again, got %#v, expected %#v", nsig, sig)
@@ -64,7 +80,6 @@ func TestSig(t *testing.T) {
 
 	var empty smtp.Localpart
 	sig1 := &Sig{
-		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -85,7 +100,6 @@ func TestSig(t *testing.T) {
 
 	ulp := smtp.Localpart("møx")
 	sig2 := &Sig{
-		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -105,7 +119,6 @@ func TestSig(t *testing.T) {
 
 	multiatom := smtp.Localpart("a.b.c")
 	sig3 := &Sig{
-		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -124,7 +137,6 @@ func TestSig(t *testing.T) {
 
 	quotedlp := smtp.Localpart(`test "\test`)
 	sig4 := &Sig{
-		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Version:          1,
 		AlgorithmSign:    "ed25519",
 		AlgorithmHash:    "sha256",
@@ -141,19 +153,19 @@ func TestSig(t *testing.T) {
 	}
 	test("dkim-signature: v = 1 ; a=ed25519-sha256; s=test; d=mox.example; h=from; b=dGVzdAo=; bh=LjkN2rUhrS3zKXfH2vNgUzz5ERRJkgP9CURXBX0JP0Q= ; i=\"test \\\"\\\\test\"@mox.example\r\n", true, sig4, nil)
 
-	test("", true, nil, errSigMissingCRLF)
-	test("other: ...\r\n", true, nil, errSigHeader)
-	test("dkim-signature: v=2\r\n", true, nil, errSigUnknownVersion)
-	test("dkim-signature: v=1\r\n", true, nil, errSigMissingTag)
-	test("dkim-signature: v=1;v=1\r\n", true, nil, errSigDuplicateTag)
-	test("dkim-signature: v=1; d=mox.example; i=@unrelated.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=LjkN2rUhrS3zKXfH2vNgUzz5ERRJkgP9CURXBX0JP0Q=\r\n", true, nil, errSigIdentityDomain)
-	test("dkim-signature: v=1; t=10; x=9; d=mox.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=LjkN2rUhrS3zKXfH2vNgUzz5ERRJkgP9CURXBX0JP0Q=\r\n", true, nil, errSigExpired)
+	test("", true, nil, ErrSigMissingCRLF)
+	test("other: ...\r\n", true, nil, ErrSigHeader)
+	test("dkim-signature: v=2\r\n", true, nil, ErrSigUnknownVersion)
+	test("dkim-signature: v=1\r\n", true, nil, ErrSigMissingTag)
+	test("dkim-signature: v=1;v=1\r\n", true, nil, ErrSigDuplicateTag)
+	test("dkim-signature: v=1; d=mox.example; i=@unrelated.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=LjkN2rUhrS3zKXfH2vNgUzz5ERRJkgP9CURXBX0JP0Q=\r\n", true, nil, ErrSigIdentityDomain)
+	test("dkim-signature: v=1; t=10; x=9; d=mox.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=LjkN2rUhrS3zKXfH2vNgUzz5ERRJkgP9CURXBX0JP0Q=\r\n", true, nil, ErrSigExpiredX)
 	test("dkim-signature: v=1; d=møx.example\r\n", true, nil, parseErr("")) // Unicode domain not allowed.
 	test("dkim-signature: v=1; s=tést\r\n", true, nil, parseErr(""))        // Unicode selector not allowed.
 	test("dkim-signature: v=1; ;\r\n", true, nil, parseErr(""))             // Empty tag not allowed.
 	test("dkim-signature: v=1; \r\n", true, nil, parseErr(""))              // Cannot have whitespace after last colon.
-	test("dkim-signature: v=1; d=mox.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=dGVzdAo=\r\n", true, nil, errSigBodyHash)
-	test("dkim-signature: v=1; d=mox.example; s=test; a=rsa-sha1; h=from; b=dGVzdAo=; bh=dGVzdAo=\r\n", true, nil, errSigBodyHash)
+	test("dkim-signature: v=1; d=mox.example; s=test; a=ed25519-sha256; h=from; b=dGVzdAo=; bh=dGVzdAo=\r\n", true, nil, ErrSigBodyHash)
+	test("dkim-signature: v=1; d=mox.example; s=test; a=rsa-sha1; h=from; b=dGVzdAo=; bh=dGVzdAo=\r\n", true, nil, ErrSigBodyHash)
 }
 
 func TestCopiedHeadersSig(t *testing.T) {
@@ -168,7 +180,7 @@ func TestCopiedHeadersSig(t *testing.T) {
 	b=dzdVyOfAKCdLXdJOc9G2q8LoXSlEniSbav+yuU4zGeeruD00lszZVoG4ZHRNiYzR
 `, "\n", "\r\n")
 
-	sig, _, err := ParseSignature([]byte(sigHeader), DKIMSpec.HeaderName, false, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
+	sig, err := ParseSignature(&utils.Header{Key: DKIMSpec.HeaderName, Raw: []byte(sigHeader)}, false, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 	if err != nil {
 		t.Fatalf("parsing dkim signature with copied headers: %v", err)
 	}

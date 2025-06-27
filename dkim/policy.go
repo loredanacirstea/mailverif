@@ -48,7 +48,7 @@ func DefaultPolicy(sig *Sig) error {
 	}
 
 	if sig.Version != 1 {
-		return fmt.Errorf("%w: version %d", errSigUnknownVersion, sig.Version)
+		return fmt.Errorf("%w: version %d", ErrSigUnknownVersion, sig.Version)
 	}
 
 	return nil
@@ -73,7 +73,7 @@ func DefaultParsingPolicy(ds *Sig, p *Parser, fieldName string) (bool, error) {
 		// ../rfc/6376:1025
 		ds.Version = int(p.XNumber(10))
 		if ds.Version != 1 {
-			return true, fmt.Errorf("%w: version %d", errSigUnknownVersion, ds.Version)
+			return true, fmt.Errorf("%w: version %d", ErrSigUnknownVersion, ds.Version)
 		}
 		return true, nil
 	case "i":
@@ -83,4 +83,8 @@ func DefaultParsingPolicy(ds *Sig, p *Parser, fieldName string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func DefaultPrefixHeaders() []utils.Header {
+	return nil
 }

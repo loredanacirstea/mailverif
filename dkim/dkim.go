@@ -91,6 +91,7 @@ var DKIMSpec = Spec{
 	PolicyParsing:        DefaultParsingPolicy,
 	CheckSignatureParams: CheckSignatureParamsDKIM,
 	NewSigWithDefaults:   NewDKIMSigWithDefaults,
+	GetPrefixHeaders:     DefaultPrefixHeaders,
 }
 
 // Result is the conclusion of verifying one DKIM-Signature header. An email can
@@ -105,6 +106,7 @@ type Result struct {
 	RecordAuthentic bool    // Whether DKIM DNS record was DNSSEC-protected. Only valid if Sig is non-nil.
 	Expired         bool
 	Err             error // If Status is not StatusPass, this error holds the details and can be checked using errors.Is.
+	Index           int   // for chain signatures
 }
 
 // todo: use some io.Writer to hash the body and the header.
@@ -131,7 +133,6 @@ type Selector struct {
 
 func NewDKIMSigWithDefaults() *Sig {
 	return &Sig{
-		HeaderName:       DKIM_SIGNATURE_HEADER,
 		Canonicalization: "simple/simple",
 		Length:           -1,
 		SignTime:         -1,
@@ -155,7 +156,7 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 	for _, sig := range sigs {
 		sig.Identity = &Identity{&local, domain}
 	}
-	return SignGeneric(sigs, hdrs)
+	return SignGeneric(sigs, hdrs, nil)
 }
 
 // Verify parses the DKIM-Signature headers in a message and verifies each of them.
@@ -176,7 +177,13 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func
 	if policy != nil {
 		spec.PolicySig = policy
 	}
-	return VerifyGeneric(elog, spec, resolver, smtputf8, r, ignoreTest, strictExpiration, now, rec)
+
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
+	}
+
+	return VerifyGeneric(elog, spec, resolver, smtputf8, hdrs, bodyOffset, r, ignoreTest, strictExpiration, now, rec)
 }
 
 // check if signature is acceptable.
@@ -265,11 +272,11 @@ func Lookup(elog *slog.Logger, resolver dns.Resolver, selector, domain dns.Domai
 }
 
 // lookup the public key in the DNS and verify the signature.
-func VerifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool, record *Record) (Status, *Record, bool, error) {
+func VerifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, prefixHeaders []utils.Header, body *bufio.Reader, ignoreTestMode bool, record *Record) (Status, *Record, bool, error) {
 	var status Status
 	var err error
 	var authentic bool = false
-	if record == nil {
+	if record == nil && sig.Domain.String() != "" {
 		// ../rfc/6376:2604
 		status, record, _, authentic, err = Lookup(elog, resolver, sig.Selector, sig.Domain)
 		if err != nil {
@@ -277,12 +284,15 @@ func VerifySignature(elog *slog.Logger, resolver dns.Resolver, sig *Sig, hash cr
 			return status, nil, authentic, err
 		}
 	}
-	status, err = VerifySignatureRecord(record, sig, hash, canonHeaderSimple, canonDataSimple, hdrs, verifySig, body, ignoreTestMode)
-	return status, record, authentic, err
+	if sig.AlgorithmSign != "" {
+		status, err = VerifySignatureRecord(record, sig, hash, canonHeaderSimple, canonDataSimple, hdrs, prefixHeaders, body, ignoreTestMode)
+		return status, record, authentic, err
+	}
+	return StatusPass, record, authentic, nil
 }
 
 // verify a DKIM signature given the record from dns and signature from the email message.
-func VerifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, verifySig []byte, body *bufio.Reader, ignoreTestMode bool) (rstatus Status, rerr error) {
+func VerifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSimple, canonDataSimple bool, hdrs []utils.Header, prefixHeaders []utils.Header, body *bufio.Reader, ignoreTestMode bool) (rstatus Status, rerr error) {
 	if !ignoreTestMode {
 		// ../rfc/6376:1558
 		y := false
@@ -353,7 +363,7 @@ func VerifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSim
 	// ../rfc/6376:1700
 	// ../rfc/6376:2656
 
-	dh, err := DataHash(hash.New(), canonHeaderSimple, sig, hdrs, verifySig)
+	dh, err := DataHash(hash.New(), canonHeaderSimple, sig, hdrs, prefixHeaders)
 	if err != nil {
 		// Any error is likely an invalid header field in the message, hence permanent error.
 		return StatusPermerror, fmt.Errorf("calculating data hash: %w", err)
@@ -372,13 +382,15 @@ func VerifySignatureRecord(r *Record, sig *Sig, hash crypto.Hash, canonHeaderSim
 		return StatusPermerror, fmt.Errorf("%w: unrecognized signature algorithm %q", ErrSigAlgorithmUnknown, r.Key)
 	}
 
-	bh, err := BodyHash(hash.New(), canonDataSimple, body)
-	if err != nil {
-		// Any error is likely some internal error, hence temporary error.
-		return StatusTemperror, fmt.Errorf("calculating body hash: %w", err)
-	}
-	if !bytes.Equal(sig.BodyHash, bh) {
-		return StatusFail, fmt.Errorf("%w: signature bodyhash %x != calculated bodyhash %x", ErrBodyhashMismatch, sig.BodyHash, bh)
+	if len(sig.BodyHash) > 0 {
+		bh, err := BodyHash(hash.New(), canonDataSimple, body)
+		if err != nil {
+			// Any error is likely some internal error, hence temporary error.
+			return StatusTemperror, fmt.Errorf("calculating body hash: %w", err)
+		}
+		if !bytes.Equal(sig.BodyHash, bh) {
+			return StatusFail, fmt.Errorf("%w: signature bodyhash %x != calculated bodyhash %x", ErrBodyhashMismatch, sig.BodyHash, bh)
+		}
 	}
 
 	return StatusPass, nil
@@ -494,9 +506,26 @@ func BodyHash(h hash.Hash, canonSimple bool, body *bufio.Reader) ([]byte, error)
 	return h.Sum(nil), nil
 }
 
-func DataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []utils.Header, verifySig []byte) ([]byte, error) {
+func DataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []utils.Header, prefixHeaders []utils.Header) ([]byte, error) {
 	headers := ""
 	revHdrs := map[string][]utils.Header{}
+
+	// e.g. chain signatures include previous chain instance signatures
+	for _, h := range prefixHeaders {
+		s := string(h.Raw)
+		if canonSimple {
+			// ../rfc/6376:823
+			// Add unmodified.
+			headers += s
+		} else {
+			ch, err := relaxedCanonicalHeaderWithoutCRLF(s)
+			if err != nil {
+				return nil, fmt.Errorf("canonicalizing header: %w", err)
+			}
+			headers += ch + "\r\n"
+		}
+	}
+
 	for _, h := range hdrs {
 		revHdrs[h.LKey] = append([]utils.Header{h}, revHdrs[h.LKey]...)
 	}
@@ -523,9 +552,9 @@ func DataHash(h hash.Hash, canonSimple bool, sig *Sig, hdrs []utils.Header, veri
 	}
 	// ../rfc/6376:2377, canonicalization does not apply to the dkim-signature header.
 	h.Write([]byte(headers))
-	dkimSig := verifySig
+	dkimSig := sig.VerifySig
 	if !canonSimple {
-		ch, err := relaxedCanonicalHeaderWithoutCRLF(string(verifySig))
+		ch, err := relaxedCanonicalHeaderWithoutCRLF(string(sig.VerifySig))
 		if err != nil {
 			return nil, fmt.Errorf("canonicalizing DKIM-Signature header: %w", err)
 		}

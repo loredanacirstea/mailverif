@@ -2,12 +2,14 @@ package dkim
 
 import (
 	"testing"
+
+	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
 func FuzzParseSignature(f *testing.F) {
 	f.Add([]byte(""))
 	f.Fuzz(func(t *testing.T, buf []byte) {
-		ParseSignature(buf, DKIM_SIGNATURE_HEADER, false, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
+		ParseSignature(&utils.Header{Key: DKIM_SIGNATURE_HEADER, Raw: buf}, false, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 	})
 }
 

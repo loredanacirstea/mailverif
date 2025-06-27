@@ -90,7 +90,9 @@ func (p *Parser) xtakefn1(ignoreFWS bool, fn func(c rune, i int) bool) string {
 		if !fn(c, i) {
 			switch c {
 			case ' ', '\t', '\r', '\n':
-				continue
+				if ignoreFWS {
+					continue
+				}
 			}
 			if i == 0 {
 				p.xerrorf("expected at least 1 char")
@@ -505,3 +507,77 @@ func (p *Parser) xztagcopy() string {
 	v := p.xqphdrvalue(true)
 	return f + ":" + v
 }
+
+// ---- exports -----
+
+func NewParser(s string, smtputf8 bool) Parser {
+	return Parser{s: s, smtputf8: smtputf8}
+}
+
+func (p *Parser) DottedName(ignoreFWS bool) string {
+	return p.xtakefn1(ignoreFWS, func(c rune, i int) bool {
+		// allow printable ASCII except the separators we care about
+		return c > ' ' && c < 0x7f && c != ':' && c != ';' && c != '='
+	})
+}
+
+func (p *Parser) StatusValue() string {
+	return p.xtakefn1(false, func(c rune, i int) bool {
+		return isalpha(c)
+	})
+}
+
+func (p *Parser) GetS() string       { return p.s }
+func (p *Parser) GetO() int          { return p.o }
+func (p *Parser) GetTracked() string { return p.tracked }
+func (p *Parser) GetDrop() bool      { return p.drop }
+func (p *Parser) GetSmtputf8() bool  { return p.smtputf8 }
+
+func (p *Parser) SetS(s string)             { p.s = s }
+func (p *Parser) SetO(o int)                { p.o = o }
+func (p *Parser) SetTracked(tracked string) { p.tracked = tracked }
+func (p *Parser) SetDrop(drop bool)         { p.drop = drop }
+func (p *Parser) SetSmtputf8(smtputf8 bool) { p.smtputf8 = smtputf8 }
+
+func (p *Parser) XErrorf(format string, args ...any) { p.xerrorf(format, args...) }
+func (p *Parser) Track(s string)                     { p.track(s) }
+func (p *Parser) HasPrefix(s string) bool            { return p.hasPrefix(s) }
+func (p *Parser) XTaken(n int) string                { return p.xtaken(n) }
+func (p *Parser) XTakeFn(ignoreFWS bool, fn func(rune, int) bool) string {
+	return p.xtakefn(ignoreFWS, fn)
+}
+func (p *Parser) Empty() bool { return p.empty() }
+func (p *Parser) XNonempty()  { p.xnonempty() }
+func (p *Parser) XTakeFn1(ignoreFWS bool, fn func(rune, int) bool) string {
+	return p.xtakefn1(ignoreFWS, fn)
+}
+func (p *Parser) Wsp()                  { p.wsp() }
+func (p *Parser) Fws()                  { p.fws() }
+func (p *Parser) Peekfws(s string) bool { return p.peekfws(s) }
+func (p *Parser) XTake(s string) string { return p.xtake(s) }
+func (p *Parser) Take(s string) bool    { return p.take(s) }
+
+func (p *Parser) XTagName() string                    { return p.xtagName() }
+func (p *Parser) XAlgorithm() (string, string)        { return p.xalgorithm() }
+func (p *Parser) XBase64() []byte                     { return p.xbase64() }
+func (p *Parser) XCanonical() string                  { return p.xcanonical() }
+func (p *Parser) XDomainSelector(sel bool) dns.Domain { return p.xdomainselector(sel) }
+func (p *Parser) XDomain() dns.Domain                 { return p.xdomain() }
+func (p *Parser) XSelector() dns.Domain               { return p.xselector() }
+func (p *Parser) XHdrName(ignoreFWS bool) string      { return p.xhdrName(ignoreFWS) }
+func (p *Parser) XSignedHeaderFields() []string       { return p.xsignedHeaderFields() }
+func (p *Parser) XAuid() Identity                     { return p.xauid() }
+func (p *Parser) XLocalpart() smtp.Localpart          { return p.xlocalpart() }
+func (p *Parser) XQuotedString() string               { return p.xquotedString() }
+func (p *Parser) XChar() rune                         { return p.xchar() }
+func (p *Parser) XAtom() string                       { return p.xatom() }
+func (p *Parser) XBodyLength() int64                  { return p.xbodyLength() }
+func (p *Parser) XQueryMethods() []string             { return p.xqueryMethods() }
+func (p *Parser) XQTagMethod() string                 { return p.xqtagmethod() }
+func (p *Parser) XHyphenatedWord() string             { return p.xhyphenatedWord() }
+func (p *Parser) XQpHdrValue(ignoreFWS bool) string   { return p.xqphdrvalue(ignoreFWS) }
+func (p *Parser) XQpSection() string                  { return p.xqpSection() }
+func (p *Parser) XQp(pipe, colon, ignore bool) string { return p.xqp(pipe, colon, ignore) }
+func (p *Parser) XTimestamp() int64                   { return p.xtimestamp() }
+func (p *Parser) XCopiedHeaderFields() []string       { return p.xcopiedHeaderFields() }
+func (p *Parser) XZTagCopy() string                   { return p.xztagcopy() }

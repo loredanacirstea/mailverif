@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/loredanacirstea/mailverif/dns"
+	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
 var pkglog = slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -106,7 +107,7 @@ func TestParseSignature(t *testing.T) {
         B/aHff1A==
 `
 	smtputf8 := true
-	_, _, err := ParseSignature([]byte(strings.ReplaceAll(hdr, "\n", "\r\n")), DKIM_SIGNATURE_HEADER, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
+	_, err := ParseSignature(&utils.Header{Key: DKIM_SIGNATURE_HEADER, Raw: []byte(strings.ReplaceAll(hdr, "\n", "\r\n"))}, smtputf8, DKIMSpec.RequiredTags, DKIMSpec.PolicyParsing, DKIMSpec.NewSigWithDefaults)
 	if err != nil {
 		t.Fatalf("parsing signature: %s", err)
 	}
@@ -477,7 +478,7 @@ test
 	})
 
 	// Invalid DKIM-Signature header. ../rfc/6376:2503
-	test(nil, StatusPermerror, errSigMissingTag, func() {
+	test(nil, StatusPermerror, ErrSigMissingTag, func() {
 		msg = strings.ReplaceAll("DKIM-Signature: v=1\n"+msg, "\n", "\r\n")
 		signed = true
 	})

@@ -38,18 +38,19 @@ type Spec struct {
 	PolicyParsing        func(ds *Sig, p *Parser, fieldName string) (bool, error)
 	CheckSignatureParams func(sig *Sig) error
 	NewSigWithDefaults   func() *Sig
+	GetPrefixHeaders     func() []utils.Header
+	ParseSignature       func(header *utils.Header, smtputf8 bool, required []string, parsingPolicy func(ds *Sig, p *Parser, fieldName string) (bool, error), newSig func() *Sig) (sig *Sig, err error)
 }
 
 // Sig is a signature header for DKIM, ARC and others
 // String values must be compared case insensitively.
 type Sig struct {
-	// Name of the header this signature came from (e.g. "DKIM-Signature").
-	HeaderName string
 	// Required fields.
 	Version       int        // Version, 1. Field "v". Always the first field.
 	AlgorithmSign string     // "rsa" or "ed25519". Field "a".
 	AlgorithmHash string     // "sha256" or the deprecated "sha1" (deprecated). Field "a".
 	Signature     []byte     // Field "b".
+	VerifySig     []byte     // ?
 	BodyHash      []byte     // Field "bh".
 	Domain        dns.Domain // Field "d".
 	SignedHeaders []string   // Duplicates are meaningful. Field "h".
@@ -72,8 +73,10 @@ type Sig struct {
 
 	Instance int32 // for chain signatures, like ARC
 
+	HeaderFull *utils.Header
+
 	// Everything else (cv, spf, dmarc, …) lives here.
-	Tags map[string]string
+	Tags []map[string]string
 }
 
 // Identity is used for the optional i= field in a DKIM-Signature header. It uses
@@ -106,7 +109,7 @@ func (s *Sig) Header() (string, error) {
 	// ../rfc/6376:1021
 	// todo: make a higher-level writer that accepts pairs, and only folds to next line when needed.
 	w := &message.HeaderWriter{}
-	w.Addf("", "%s: v=%d;", s.HeaderName, s.Version)
+	w.Addf("", "%s: v=%d;", s.HeaderFull.Key, s.Version)
 	// Domain names must always be in ASCII. ../rfc/6376:1115 ../rfc/6376:1187 ../rfc/6376:1303
 	w.Addf(" ", "d=%s;", s.Domain.ASCII)
 	w.Addf(" ", "s=%s;", s.Selector.ASCII)
@@ -198,14 +201,14 @@ func packQpHdrValue(s string) string {
 }
 
 var (
-	errSigHeader         = errors.New("not DKIM-Signature header")
-	errSigDuplicateTag   = errors.New("duplicate tag")
-	errSigMissingCRLF    = errors.New("missing crlf at end")
-	errSigExpired        = errors.New("signature timestamp (t=) must be before signature expiration (x=)")
-	errSigIdentityDomain = errors.New("identity domain (i=) not under domain (d=)")
-	errSigMissingTag     = errors.New("missing required tag")
-	errSigUnknownVersion = errors.New("unknown version")
-	errSigBodyHash       = errors.New("bad body hash size given algorithm")
+	ErrSigHeader         = errors.New("not DKIM-Signature header")
+	ErrSigDuplicateTag   = errors.New("duplicate tag")
+	ErrSigMissingCRLF    = errors.New("missing crlf at end")
+	ErrSigExpiredX       = errors.New("signature timestamp (t=) must be before signature expiration (x=)")
+	ErrSigIdentityDomain = errors.New("identity domain (i=) not under domain (d=)")
+	ErrSigMissingTag     = errors.New("missing required tag")
+	ErrSigUnknownVersion = errors.New("unknown version")
+	ErrSigBodyHash       = errors.New("bad body hash size given algorithm")
 )
 
 // parseSignatures returns the parsed form of a DKIM-Signature header.
@@ -215,41 +218,40 @@ var (
 // The dkim signature with signature left empty ("b=") and without trailing
 // crlf is returned, for use in verification.
 func ParseSignature(
-	buf []byte,
-	headerName string,
+	header *utils.Header,
 	smtputf8 bool,
 	required []string,
 	parsingPolicy func(ds *Sig, p *Parser, fieldName string) (bool, error),
 	newSig func() *Sig,
-) (sig *Sig, verifySig []byte, err error) {
+) (sig *Sig, err error) {
 	defer func() {
 		if x := recover(); x == nil {
 			return
 		} else if xerr, ok := x.(error); ok {
 			sig = nil
-			verifySig = nil
 			err = xerr
 		} else {
 			panic(x)
 		}
 	}()
+	buf := header.Raw
 
 	xerrorf := func(format string, args ...any) {
 		panic(fmt.Errorf(format, args...))
 	}
 
 	if !bytes.HasSuffix(buf, []byte("\r\n")) {
-		xerrorf("%w", errSigMissingCRLF)
+		xerrorf("%w", ErrSigMissingCRLF)
 	}
 	buf = buf[:len(buf)-2]
 
 	ds := newSig()
-	ds.HeaderName = headerName
+	ds.HeaderFull = header
 	seen := map[string]struct{}{}
 	p := Parser{s: string(buf), smtputf8: smtputf8}
 	name := p.xhdrName(false)
-	if !strings.EqualFold(name, headerName) {
-		xerrorf("%w", errSigHeader)
+	if !strings.EqualFold(name, header.Key) {
+		xerrorf("%w", ErrSigHeader)
 	}
 	p.wsp()
 	p.xtake(":")
@@ -269,7 +271,7 @@ func ParseSignature(
 		// Keys are case-sensitive: ../rfc/6376:679
 		if _, ok := seen[k]; ok {
 			// Duplicates not allowed: ../rfc/6376:683
-			xerrorf("%w: %q", errSigDuplicateTag, k)
+			xerrorf("%w: %q", ErrSigDuplicateTag, k)
 			break
 		}
 		seen[k] = struct{}{}
@@ -336,6 +338,9 @@ func ParseSignature(
 		case "z":
 			// ../rfc/6376:1361
 			ds.CopiedHeaders = p.xcopiedHeaderFields()
+		case "cv":
+			cv := p.StatusValue()
+			ds.Tags = append(ds.Tags, map[string]string{"cv": cv})
 		default:
 			found, err := parsingPolicy(ds, &p, k)
 			if found && err != nil {
@@ -363,29 +368,33 @@ func ParseSignature(
 	// ../rfc/6376:2532
 	for _, req := range required {
 		if _, ok := seen[req]; !ok {
-			xerrorf("%w: %q", errSigMissingTag, req)
+			xerrorf("%w: %q", ErrSigMissingTag, req)
 		}
 	}
 
-	if strings.EqualFold(ds.AlgorithmHash, "sha1") && len(ds.BodyHash) != 20 {
-		xerrorf("%w: got %d bytes, must be 20 for sha1", errSigBodyHash, len(ds.BodyHash))
-	} else if strings.EqualFold(ds.AlgorithmHash, "sha256") && len(ds.BodyHash) != 32 {
-		xerrorf("%w: got %d bytes, must be 32 for sha256", errSigBodyHash, len(ds.BodyHash))
+	if slices.Contains(required, "bh") {
+		if strings.EqualFold(ds.AlgorithmHash, "sha1") && len(ds.BodyHash) != 20 {
+			xerrorf("%w: got %d bytes, must be 20 for sha1", ErrSigBodyHash, len(ds.BodyHash))
+		} else if strings.EqualFold(ds.AlgorithmHash, "sha256") && len(ds.BodyHash) != 32 {
+			xerrorf("%w: got %d bytes, must be 32 for sha256", ErrSigBodyHash, len(ds.BodyHash))
+		}
 	}
 
 	// ../rfc/6376:1337
 	if ds.SignTime >= 0 && ds.ExpireTime >= 0 && ds.SignTime >= ds.ExpireTime {
-		xerrorf("%w", errSigExpired)
+		xerrorf("%w", ErrSigExpiredX)
 	}
 
 	// Default identity is "@" plus domain. We don't set this value because we want to
 	// keep the distinction between absent value.
 	// ../rfc/6376:1172 ../rfc/6376:2537 ../rfc/6376:2541
 	if ds.Identity != nil && ds.Identity.Domain.ASCII != ds.Domain.ASCII && !strings.HasSuffix(ds.Identity.Domain.ASCII, "."+ds.Domain.ASCII) {
-		xerrorf("%w: identity domain %q not under domain %q", errSigIdentityDomain, ds.Identity.Domain.ASCII, ds.Domain.ASCII)
+		xerrorf("%w: identity domain %q not under domain %q", ErrSigIdentityDomain, ds.Identity.Domain.ASCII, ds.Domain.ASCII)
 	}
 
-	return ds, []byte(p.tracked), nil
+	ds.VerifySig = []byte(p.tracked)
+
+	return ds, nil
 }
 
 func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bodyOffset int, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, timeNow func() time.Time) (sigs []*Sig, rerr error) {
@@ -403,7 +412,7 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 
 	for _, sel := range selectors {
 		sig := spec.NewSigWithDefaults()
-		sig.HeaderName = spec.HeaderName
+		sig.HeaderFull = &utils.Header{Key: spec.HeaderName, LKey: strings.ToLower(spec.HeaderName)}
 		sig.SelectorFull = sel
 		switch sel.PrivateKey.(type) {
 		case *rsa.PrivateKey:
@@ -477,7 +486,7 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 	return sigs, nil
 }
 
-func SignGeneric(sigs []*Sig, hdrs []utils.Header) (headers []string, rerr error) {
+func SignGeneric(sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header) (headers []string, rerr error) {
 	for _, sig := range sigs {
 		h, hok := algHash(sig.AlgorithmHash)
 		if !hok {
@@ -489,8 +498,9 @@ func SignGeneric(sigs []*Sig, hdrs []utils.Header) (headers []string, rerr error
 			return nil, err
 		}
 		verifySig := []byte(strings.TrimSuffix(sigh, "\r\n"))
+		sig.VerifySig = verifySig
 
-		dh, err := DataHash(h.New(), !sig.SelectorFull.HeaderRelaxed, sig, hdrs, verifySig)
+		dh, err := DataHash(h.New(), !sig.SelectorFull.HeaderRelaxed, sig, hdrs, prefixHeaders)
 		if err != nil {
 			return nil, err
 		}
@@ -525,13 +535,8 @@ func SignGeneric(sigs []*Sig, hdrs []utils.Header) (headers []string, rerr error
 // 5. Generic Verify ----------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
-	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
-	}
-
-	err = spec.PolicyHeader(hdrs)
+func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyOffset int, r io.ReaderAt, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
+	err := spec.PolicyHeader(hdrs)
 	if err != nil {
 		return nil, err
 	}
@@ -544,40 +549,49 @@ func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8
 		if h.LKey != targetKey {
 			continue
 		}
+		parseSig := spec.ParseSignature
+		if parseSig == nil {
+			parseSig = ParseSignature
+		}
 
-		// --- NEW: two‑step parser -----------------------------------------
-		sig, verifySig, err := ParseSignature(h.Raw, spec.HeaderName, smtputf8, spec.RequiredTags, spec.PolicyParsing, spec.NewSigWithDefaults)
+		sig, err := parseSig(&h, smtputf8, spec.RequiredTags, spec.PolicyParsing, spec.NewSigWithDefaults)
 		if err != nil {
-			results = append(results, Result{StatusPermerror, nil, nil, false, false, err})
+			results = append(results, Result{StatusPermerror, nil, nil, false, false, err, 0})
 			continue
 		}
 
-		hashAlg, canonHdrSimple, canonBodySimple, expired, err := CheckSignatureParamsGeneric(elog, sig, strictExp, now)
-		if err != nil {
-			results = append(results, Result{StatusPermerror, sig, nil, false, expired, err})
-			continue
-		}
-
-		if spec.CheckSignatureParams != nil {
-			err = spec.CheckSignatureParams(sig)
-			if err != nil {
-				results = append(results, Result{StatusPermerror, sig, nil, false, expired, err})
-				continue
-			}
-		}
-
-		// scheme‑specific policy check
-		if err := spec.PolicySig(sig); err != nil {
-			err := fmt.Errorf("%w: %s", ErrPolicy, err)
-			results = append(results, Result{StatusPolicy, sig, nil, false, expired, err})
-			continue
-		}
-
-		br := bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)})
-		status, txt, authentic, err := VerifySignature(elog, resolver, sig, hashAlg, canonHdrSimple, canonBodySimple, hdrs, verifySig, br, ignoreTest, rec)
-		results = append(results, Result{status, sig, txt, authentic, expired, err})
+		res := VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, sig, bodyOffset, r, ignoreTest, strictExp, now, rec)
+		results = append(results, res)
 	}
 	return results, nil
+}
+
+func VerifySignatureGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, sig *Sig, bodyOffset int, r io.ReaderAt, ignoreTest, strictExp bool, now func() time.Time, rec *Record) (result Result) {
+	hashAlg, canonHdrSimple, canonBodySimple, expired, err := CheckSignatureParamsGeneric(elog, sig, strictExp, now)
+	if err != nil {
+		return Result{StatusPermerror, sig, nil, false, expired, err, 0}
+	}
+
+	if spec.CheckSignatureParams != nil {
+		err = spec.CheckSignatureParams(sig)
+		if err != nil {
+			return Result{StatusPermerror, sig, nil, false, expired, err, 0}
+		}
+	}
+
+	// scheme‑specific policy check
+	if err := spec.PolicySig(sig); err != nil {
+		err := fmt.Errorf("%w: %s", ErrPolicy, err)
+		return Result{StatusPolicy, sig, nil, false, expired, err, 0}
+	}
+
+	br := bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)})
+	prefixHeaders := make([]utils.Header, 0)
+	if spec.GetPrefixHeaders != nil {
+		prefixHeaders = spec.GetPrefixHeaders()
+	}
+	status, txt, authentic, err := VerifySignature(elog, resolver, sig, hashAlg, canonHdrSimple, canonBodySimple, hdrs, prefixHeaders, br, ignoreTest, rec)
+	return Result{status, sig, txt, authentic, expired, err, 0}
 }
 
 // check if signature is acceptable.
@@ -592,24 +606,30 @@ func CheckSignatureParamsGeneric(elog *slog.Logger, sig *Sig, strictExpiration b
 		}
 	}
 
-	// ../rfc/6376:2554
-	// ../rfc/6376:3284
-	// Refuse signatures that reach beyond declared scope. We use the existing
-	// publicsuffix.Lookup to lookup a fake subdomain of the signing domain. If this
-	// supposed subdomain is actually an organizational domain, the signing domain
-	// shouldn't be signing for its organizational domain.
-	subdom := sig.Domain
-	subdom.ASCII = "x." + subdom.ASCII
-	if subdom.Unicode != "" {
-		subdom.Unicode = "x." + subdom.Unicode
-	}
-	if orgDom := publicsuffix.Lookup(elog, subdom); subdom.ASCII == orgDom.ASCII && !(Localserve && sig.Domain.ASCII == "localhost") {
-		return 0, false, false, expired, fmt.Errorf("%w: %s", ErrTLD, sig.Domain)
+	if sig.Domain.String() != "" {
+		// ../rfc/6376:2554
+		// ../rfc/6376:3284
+		// Refuse signatures that reach beyond declared scope. We use the existing
+		// publicsuffix.Lookup to lookup a fake subdomain of the signing domain. If this
+		// supposed subdomain is actually an organizational domain, the signing domain
+		// shouldn't be signing for its organizational domain.
+		subdom := sig.Domain
+		subdom.ASCII = "x." + subdom.ASCII
+		if subdom.Unicode != "" {
+			subdom.Unicode = "x." + subdom.Unicode
+		}
+		if orgDom := publicsuffix.Lookup(elog, subdom); subdom.ASCII == orgDom.ASCII && !(Localserve && sig.Domain.ASCII == "localhost") {
+			return 0, false, false, expired, fmt.Errorf("%w: %s", ErrTLD, sig.Domain)
+		}
 	}
 
-	h, hok := algHash(sig.AlgorithmHash)
-	if !hok {
-		return 0, false, false, expired, fmt.Errorf("%w: %q", ErrHashAlgorithmUnknown, sig.AlgorithmHash)
+	var h crypto.Hash
+	if sig.AlgorithmHash != "" {
+		var hok bool
+		h, hok = algHash(sig.AlgorithmHash)
+		if !hok {
+			return 0, false, false, expired, fmt.Errorf("%w: %q", ErrHashAlgorithmUnknown, sig.AlgorithmHash)
+		}
 	}
 
 	t := strings.SplitN(sig.Canonicalization, "/", 2)
