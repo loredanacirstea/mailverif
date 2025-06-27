@@ -27,9 +27,11 @@ import (
 
 // Spec describes one signed-header scheme (DKIM, ARC-Message-Signature, …).
 type Spec struct {
-	HeaderName          string   // e.g. "DKIM-Signature"
-	RequiredTags        []string // e.g. []{"b","bh","a","d","h","s"}
-	CanonicalizationDef string   // "", "simple/simple", "relaxed/relaxed", …
+	HeaderName             string   // e.g. "DKIM-Signature"
+	RequiredTags           []string // e.g. []{"b","bh","a","d","h","s"}
+	RequiredHeaders        []string
+	HeaderCanonicalization string // "", "simple", "relaxed"
+	BodyCanonicalization   string // "", "simple", "relaxed"
 	// Called once the generic DKIM mechanics have checked the cryptographic
 	// parts.  Allows scheme-specific extra rules (From header present, cv tag
 	// interpretation, …).
@@ -40,6 +42,7 @@ type Spec struct {
 	NewSigWithDefaults   func() *Sig
 	GetPrefixHeaders     func() []utils.Header
 	ParseSignature       func(header *utils.Header, smtputf8 bool, required []string, parsingPolicy func(ds *Sig, p *Parser, fieldName string) (bool, error), newSig func() *Sig) (sig *Sig, err error)
+	BuildSignatureHeader func(*Sig) (string, error)
 }
 
 // Sig is a signature header for DKIM, ARC and others
@@ -103,6 +106,111 @@ func (s Sig) Algorithm() string {
 	return s.AlgorithmSign + "-" + s.AlgorithmHash
 }
 
+func (s *Sig) BuildSignedHeaders(w *utils.HeaderWriter) {
+	if len(s.SignedHeaders) == 0 {
+		return
+	}
+	for i, v := range s.SignedHeaders {
+		sep := ""
+		if i == 0 {
+			v = "h=" + v
+			sep = " "
+		}
+		if i < len(s.SignedHeaders)-1 {
+			v += ":"
+		} else if i == len(s.SignedHeaders)-1 {
+			v += ";"
+		}
+		w.Addf(sep, "%s", v)
+	}
+}
+
+func (s *Sig) BuildCopiedHeaders(w *utils.HeaderWriter) error {
+	if len(s.CopiedHeaders) == 0 {
+		return nil
+	}
+	// todo: wrap long headers? we can at least add FWS before the :
+	for i, v := range s.CopiedHeaders {
+		t := strings.SplitN(v, ":", 2)
+		if len(t) == 2 {
+			v = t[0] + ":" + packQpHdrValue(t[1])
+		} else {
+			return fmt.Errorf("invalid header in copied headers (z=): %q", v)
+		}
+		sep := ""
+		if i == 0 {
+			v = "z=" + v
+			sep = " "
+		}
+		if i < len(s.CopiedHeaders)-1 {
+			v += "|"
+		} else if i == len(s.CopiedHeaders)-1 {
+			v += ";"
+		}
+		w.Addf(sep, "%s", v)
+	}
+	return nil
+}
+
+func (s *Sig) BuildBh(w *utils.HeaderWriter) {
+	w.Addf(" ", "bh=%s;", base64.StdEncoding.EncodeToString(s.BodyHash))
+}
+
+func (s *Sig) BuildDomain(w *utils.HeaderWriter) {
+	w.Addf(" ", "d=%s;", s.Domain.ASCII)
+}
+
+func (s *Sig) BuildSelector(w *utils.HeaderWriter) {
+	w.Addf(" ", "s=%s;", s.Selector.ASCII)
+}
+
+func (s *Sig) BuildIdentity(w *utils.HeaderWriter) {
+	if s.Identity != nil {
+		w.Addf(" ", "i=%s;", s.Identity.String()) // todo: Is utf-8 ok here?
+	}
+}
+
+func (s *Sig) BuildAlgorithm(w *utils.HeaderWriter) {
+	w.Addf(" ", "a=%s;", s.Algorithm())
+}
+
+func (s *Sig) BuildCanonicalization(w *utils.HeaderWriter) {
+	if s.Canonicalization != "" && !strings.EqualFold(s.Canonicalization, "simple") && !strings.EqualFold(s.Canonicalization, "simple/simple") {
+		w.Addf(" ", "c=%s;", s.Canonicalization)
+	}
+}
+
+func (s *Sig) BuildLength(w *utils.HeaderWriter) {
+	if s.Length >= 0 {
+		w.Addf(" ", "l=%d;", s.Length)
+	}
+}
+
+func (s *Sig) BuildQueryMethods(w *utils.HeaderWriter) {
+	if len(s.QueryMethods) > 0 && !(len(s.QueryMethods) == 1 && strings.EqualFold(s.QueryMethods[0], "dns/txt")) {
+		w.Addf(" ", "q=%s;", strings.Join(s.QueryMethods, ":"))
+	}
+}
+
+func (s *Sig) BuildSignTime(w *utils.HeaderWriter) {
+	if s.SignTime >= 0 {
+		w.Addf(" ", "t=%d;", s.SignTime)
+	}
+}
+
+func (s *Sig) BuildExpireTime(w *utils.HeaderWriter) {
+	if s.ExpireTime >= 0 {
+		w.Addf(" ", "x=%d;", s.ExpireTime)
+	}
+}
+
+func (s *Sig) BuildSignature(w *utils.HeaderWriter) {
+	w.Addf(" ", "b=")
+	if len(s.Signature) > 0 {
+		w.AddWrap([]byte(base64.StdEncoding.EncodeToString(s.Signature)), false)
+	}
+}
+
 // Header returns the DKIM-Signature header in string form, to be prepended to a
 // message, including DKIM-Signature field name and trailing \r\n.
 func (s *Sig) Header() (string, error) {
@@ -110,74 +218,25 @@ func (s *Sig) Header() (string, error) {
 	// todo: make a higher-level writer that accepts pairs, and only folds to next line when needed.
 	w := &message.HeaderWriter{}
 	w.Addf("", "%s: v=%d;", s.HeaderFull.Key, s.Version)
+
 	// Domain names must always be in ASCII. ../rfc/6376:1115 ../rfc/6376:1187 ../rfc/6376:1303
-	w.Addf(" ", "d=%s;", s.Domain.ASCII)
-	w.Addf(" ", "s=%s;", s.Selector.ASCII)
-	if s.Identity != nil {
-		w.Addf(" ", "i=%s;", s.Identity.String()) // todo: Is utf-8 ok here?
+	s.BuildDomain(w)
+	s.BuildSelector(w)
+	s.BuildIdentity(w)
+	s.BuildAlgorithm(w)
+	s.BuildCanonicalization(w)
+	s.BuildLength(w)
+	s.BuildQueryMethods(w)
+	s.BuildSignTime(w)
+	s.BuildExpireTime(w)
+	s.BuildSignedHeaders(w)
+	err := s.BuildCopiedHeaders(w)
+	if err != nil {
+		return "", err
 	}
-	w.Addf(" ", "a=%s;", s.Algorithm())
+	s.BuildBh(w)
+	s.BuildSignature(w)
 
-	if s.Canonicalization != "" && !strings.EqualFold(s.Canonicalization, "simple") && !strings.EqualFold(s.Canonicalization, "simple/simple") {
-		w.Addf(" ", "c=%s;", s.Canonicalization)
-	}
-	if s.Length >= 0 {
-		w.Addf(" ", "l=%d;", s.Length)
-	}
-	if len(s.QueryMethods) > 0 && !(len(s.QueryMethods) == 1 && strings.EqualFold(s.QueryMethods[0], "dns/txt")) {
-		w.Addf(" ", "q=%s;", strings.Join(s.QueryMethods, ":"))
-	}
-	if s.SignTime >= 0 {
-		w.Addf(" ", "t=%d;", s.SignTime)
-	}
-	if s.ExpireTime >= 0 {
-		w.Addf(" ", "x=%d;", s.ExpireTime)
-	}
-
-	if len(s.SignedHeaders) > 0 {
-		for i, v := range s.SignedHeaders {
-			sep := ""
-			if i == 0 {
-				v = "h=" + v
-				sep = " "
-			}
-			if i < len(s.SignedHeaders)-1 {
-				v += ":"
-			} else if i == len(s.SignedHeaders)-1 {
-				v += ";"
-			}
-			w.Addf(sep, "%s", v)
-		}
-	}
-	if len(s.CopiedHeaders) > 0 {
-		// todo: wrap long headers? we can at least add FWS before the :
-		for i, v := range s.CopiedHeaders {
-			t := strings.SplitN(v, ":", 2)
-			if len(t) == 2 {
-				v = t[0] + ":" + packQpHdrValue(t[1])
-			} else {
-				return "", fmt.Errorf("invalid header in copied headers (z=): %q", v)
-			}
-			sep := ""
-			if i == 0 {
-				v = "z=" + v
-				sep = " "
-			}
-			if i < len(s.CopiedHeaders)-1 {
-				v += "|"
-			} else if i == len(s.CopiedHeaders)-1 {
-				v += ";"
-			}
-			w.Addf(sep, "%s", v)
-		}
-	}
-
-	w.Addf(" ", "bh=%s;", base64.StdEncoding.EncodeToString(s.BodyHash))
-
-	w.Addf(" ", "b=")
-	if len(s.Signature) > 0 {
-		w.AddWrap([]byte(base64.StdEncoding.EncodeToString(s.Signature)), false)
-	}
 	w.Add("\r\n")
 	return w.String(), nil
 }
@@ -398,6 +457,9 @@ func ParseSignature(
 }
 
 func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bodyOffset int, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, timeNow func() time.Time) (sigs []*Sig, rerr error) {
+	for i, s := range selectors {
+		selectors[i] = ApplySpecToSelector(&spec, s)
+	}
 	err := spec.PolicyHeader(hdrs)
 	if err != nil {
 		return nil, err
@@ -486,14 +548,19 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 	return sigs, nil
 }
 
-func SignGeneric(sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header) (headers []string, rerr error) {
+func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header) (headers []string, rerr error) {
 	for _, sig := range sigs {
 		h, hok := algHash(sig.AlgorithmHash)
 		if !hok {
 			return nil, fmt.Errorf("unrecognized hash algorithm %q", sig.AlgorithmHash)
 		}
-
-		sigh, err := sig.Header()
+		var sigh string
+		var err error
+		if spec.BuildSignatureHeader != nil {
+			sigh, err = spec.BuildSignatureHeader(sig)
+		} else {
+			sigh, err = sig.Header()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -522,7 +589,11 @@ func SignGeneric(sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header)
 			return nil, fmt.Errorf("unsupported private key type: %s", err)
 		}
 
-		sigh, err = sig.Header()
+		if spec.BuildSignatureHeader != nil {
+			sigh, err = spec.BuildSignatureHeader(sig)
+		} else {
+			sigh, err = sig.Header()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -669,4 +740,17 @@ func CheckSignatureParamsGeneric(elog *slog.Logger, sig *Sig, strictExpiration b
 	}
 
 	return h, canonHeaderSimple, canonBodySimple, expired, nil
+}
+
+func ApplySpecToSelector(spec *Spec, sel Selector) Selector {
+	if spec.HeaderCanonicalization != "" {
+		sel.HeaderRelaxed = spec.HeaderCanonicalization == "relaxed"
+	}
+	if spec.BodyCanonicalization != "" {
+		sel.BodyRelaxed = spec.BodyCanonicalization == "relaxed"
+	}
+	if len(spec.RequiredHeaders) > 0 {
+		sel.Headers = spec.RequiredHeaders
+	}
+	return sel
 }

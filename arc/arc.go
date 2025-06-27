@@ -13,6 +13,7 @@ import (
 
 	"github.com/loredanacirstea/mailverif/dkim"
 	"github.com/loredanacirstea/mailverif/dns"
+	message "github.com/loredanacirstea/mailverif/utils"
 	moxio "github.com/loredanacirstea/mailverif/utils"
 	smtp "github.com/loredanacirstea/mailverif/utils"
 	utils "github.com/loredanacirstea/mailverif/utils"
@@ -58,22 +59,17 @@ type ArcSetResult struct {
 	CV       dkim.Status `json:"cv"`
 }
 
-type arcResult struct {
-	instance int
-	amsValid bool
-	asValid  bool
-	cv       dkim.Status
-}
-
 type arcSet struct {
 	sigs []*dkim.Sig
 	i    int
 }
 
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
-	headerNames := []string{ARC_AUTH_HEADER, ARC_MS_HEADER, ARC_SEAL_HEADER}
-	specs := []dkim.Spec{AuthResultsSpec, ArcMessageSignatureSpec, ArcSealSpec}
+var (
+	HEADER_NAMES = []string{ARC_AUTH_HEADER, ARC_MS_HEADER, ARC_SEAL_HEADER}
+	SPECS        = []dkim.Spec{AuthResultsSpec, ArcMessageSignatureSpec, ArcSealSpec}
+)
 
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
@@ -83,7 +79,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 		return &ArcResult{Result: dkim.Result{Status: dkim.StatusNone}}, nil
 	}
 
-	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, bodyOffset, headerNames, specs, smtputf8, r, ignoreTest, now, rec)
+	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, bodyOffset, HEADER_NAMES, SPECS, smtputf8, r, ignoreTest, now, rec)
 	if err != nil {
 		return &ArcResult{Result: dkim.Result{Status: status, Err: err}}, nil
 	}
@@ -154,45 +150,122 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 
 // Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
 func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, now func() time.Time) ([]string, error) {
-	// hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
-	// if err != nil {
-	// 	return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
-	// }
-	return nil, nil
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
+	}
+
+	if len(hdrs) == 0 {
+		return nil, fmt.Errorf("no headers")
+	}
+
+	arcSets, err := ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
+	if err != nil {
+		return nil, err
+	}
+	instance := len(arcSets) + 1
+
+	signedHeaders := []string{}
+
+	_selectors := make([]dkim.Selector, len(selectors))
+	copy(_selectors, selectors)
+	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+	if err != nil {
+		return nil, err
+	}
+	sigsAuth[0].Instance = int32(instance)
+	// TODO verify & include in sig: dkim, dmarc, spf
+	sigsAuth[0].Tags = []map[string]string{
+		{"authserv-id": "example.org"},
+		{"dkim": "pass", "header.d": "example.org"},
+		{"spf": "pass", "smtp.mailfrom": "joe@football.example.com"},
+		{"dmarc": "pass", "header.from": "football.example.com"},
+	}
+	headers, err := dkim.SignGeneric(AuthResultsSpec, sigsAuth, hdrs, nil)
+	if err != nil {
+		return nil, err
+	}
+	sigsAuth[0].HeaderFull.Raw = []byte(headers[0])
+	signedHeaders = append(signedHeaders, headers...)
+
+	_selectors = make([]dkim.Selector, len(selectors))
+	copy(_selectors, selectors)
+	sigsMS, err := dkim.BuildSignatureGeneric(elog, ArcMessageSignatureSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+	if err != nil {
+		return nil, err
+	}
+	sigsMS[0].Instance = int32(instance)
+	headers, err = dkim.SignGeneric(ArcMessageSignatureSpec, sigsMS, hdrs, nil)
+	if err != nil {
+		return nil, err
+	}
+	sigsMS[0].HeaderFull.Raw = []byte(headers[0])
+	signedHeaders = append(signedHeaders, headers...)
+
+	// seal
+	arcSets = append(arcSets, arcSet{sigs: []*dkim.Sig{sigsAuth[0], sigsMS[0]}, i: instance})
+	prefixed := getChainHeaders(arcSets, instance-1)
+
+	_selectors = make([]dkim.Selector, len(selectors))
+	copy(_selectors, selectors)
+	sigsAS, err := dkim.BuildSignatureGeneric(elog, ArcSealSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+	if err != nil {
+		return nil, err
+	}
+	sigsAS[0].Instance = int32(instance)
+	// TODO
+	sigsAS[0].Tags = []map[string]string{
+		{"cv": "none"},
+	}
+	headers, err = dkim.SignGeneric(ArcSealSpec, sigsAS, hdrs, prefixed)
+	if err != nil {
+		return nil, err
+	}
+	signedHeaders = append(signedHeaders, headers...)
+	return signedHeaders, nil
 }
 
 var ArcSealSpec = dkim.Spec{
-	HeaderName:           ARC_SEAL_HEADER,
-	RequiredTags:         []string{"a", "b", "d", "s", "i", "cv"},
-	CanonicalizationDef:  "relaxed/relaxed",
-	PolicySig:            PolicyArcSeal,
-	PolicyHeader:         PolicyHeadersArcSeal,
-	PolicyParsing:        PolicyParsingArcSeal,
-	CheckSignatureParams: CheckSignatureParamsArcSeal,
-	NewSigWithDefaults:   NewSigWithDefaultsArcSeal,
+	HeaderName:             ARC_SEAL_HEADER,
+	RequiredTags:           []string{"a", "b", "d", "s", "i", "cv"},
+	HeaderCanonicalization: "relaxed",
+	BodyCanonicalization:   "relaxed",
+	PolicySig:              PolicyArcSeal,
+	PolicyHeader:           PolicyHeadersArcSeal,
+	PolicyParsing:          PolicyParsingArcSeal,
+	CheckSignatureParams:   CheckSignatureParamsArcSeal,
+	NewSigWithDefaults:     NewSigWithDefaultsArcSeal,
+	BuildSignatureHeader:   BuildHeaderAS,
+	RequiredHeaders:        []string{},
 }
 
 var ArcMessageSignatureSpec = dkim.Spec{
-	HeaderName:           ARC_MS_HEADER,
-	RequiredTags:         []string{"a", "b", "bh", "d", "h", "s", "i"},
-	CanonicalizationDef:  "relaxed/relaxed",
-	PolicySig:            PolicyArcMS,
-	PolicyHeader:         PolicyHeadersArcMS,
-	PolicyParsing:        PolicyParsingArcMS,
-	CheckSignatureParams: CheckSignatureParamsArcMS,
-	NewSigWithDefaults:   NewSigWithDefaultsArcMS,
+	HeaderName:             ARC_MS_HEADER,
+	RequiredTags:           []string{"a", "b", "bh", "d", "h", "s", "i"},
+	HeaderCanonicalization: "relaxed",
+	BodyCanonicalization:   "relaxed",
+	PolicySig:              PolicyArcMS,
+	PolicyHeader:           PolicyHeadersArcMS,
+	PolicyParsing:          PolicyParsingArcMS,
+	CheckSignatureParams:   CheckSignatureParamsArcMS,
+	NewSigWithDefaults:     NewSigWithDefaultsArcMS,
+	BuildSignatureHeader:   BuildHeaderMS,
+	RequiredHeaders:        strings.Split("From,To,Cc,Bcc,Reply-To,References,In-Reply-To,Subject,Date,Message-ID,Content-Type", ","),
 }
 
 var AuthResultsSpec = dkim.Spec{
-	HeaderName:           ARC_AUTH_HEADER,
-	RequiredTags:         []string{"i"},
-	CanonicalizationDef:  "relaxed/relaxed",
-	PolicySig:            PolicyArcAuth,
-	PolicyHeader:         PolicyHeadersArcAuth,
-	PolicyParsing:        PolicyParsingArcAuth,
-	CheckSignatureParams: CheckSignatureParamsArcAuth,
-	NewSigWithDefaults:   NewSigWithDefaultsArcAuth,
-	ParseSignature:       ParseSignatureAuthResults,
+	HeaderName:             ARC_AUTH_HEADER,
+	RequiredTags:           []string{"i"},
+	HeaderCanonicalization: "relaxed",
+	BodyCanonicalization:   "relaxed",
+	PolicySig:              PolicyArcAuth,
+	PolicyHeader:           PolicyHeadersArcAuth,
+	PolicyParsing:          PolicyParsingArcAuth,
+	CheckSignatureParams:   CheckSignatureParamsArcAuth,
+	NewSigWithDefaults:     NewSigWithDefaultsArcAuth,
+	ParseSignature:         ParseSignatureAuthResults,
+	BuildSignatureHeader:   BuildHeaderAuth,
+	RequiredHeaders:        []string{},
 }
 
 func NewSigWithDefaultsArcSeal() *dkim.Sig {
@@ -567,4 +640,83 @@ loopClauses:
 		break
 	}
 	return sets, nil
+}
+
+func buildAuthResult(v map[string]string) string {
+	val := ""
+	for k, v := range v {
+		if k == "message" {
+			val += " " + v
+			break
+		}
+		val += " " + k + "=" + v
+	}
+	return val
+}
+
+func BuildHeaderAuth(s *dkim.Sig) (string, error) {
+	authServID := ""
+	results := []string{}
+	for _, t := range s.Tags {
+		v, ok := t["authserv-id"]
+		if ok {
+			authServID = v
+			continue
+		}
+		results = append(results, buildAuthResult(t))
+	}
+
+	w := &message.HeaderWriter{}
+	w.Addf("", "%s: i=%d; %s;", s.HeaderFull.Key, s.Instance, authServID)
+	// w.Addf(" ", "%s;", dkim)
+	// w.Addf(" ", "%s;", spf)
+	// w.Addf(" ", "%s", dmarc)
+	w.Addf("", "%s", strings.Join(results, ";"))
+	w.Add("\r\n")
+	return w.String(), nil
+}
+
+func BuildHeaderMS(s *dkim.Sig) (string, error) {
+	w := &message.HeaderWriter{}
+	w.Addf("", "%s: i=%d;", s.HeaderFull.Key, s.Instance)
+
+	// Domain names must always be in ASCII. ../rfc/6376:1115 ../rfc/6376:1187 ../rfc/6376:1303
+	s.BuildDomain(w)
+	s.BuildSelector(w)
+	s.BuildAlgorithm(w)
+	s.BuildCanonicalization(w)
+	s.BuildQueryMethods(w)
+	// s.BuildSignTime(w)
+	// s.BuildExpireTime(w)
+	s.BuildSignedHeaders(w)
+	s.BuildBh(w)
+	s.BuildSignature(w)
+
+	w.Add("\r\n")
+	return w.String(), nil
+}
+
+func BuildHeaderAS(s *dkim.Sig) (string, error) {
+	cv := ""
+	for _, t := range s.Tags {
+		v, ok := t["cv"]
+		if ok {
+			cv = v
+			break
+		}
+	}
+
+	w := &message.HeaderWriter{}
+	w.Addf("", "%s: i=%d;", s.HeaderFull.Key, s.Instance)
+
+	// Domain names must always be in ASCII. ../rfc/6376:1115 ../rfc/6376:1187 ../rfc/6376:1303
+	s.BuildDomain(w)
+	s.BuildSelector(w)
+	s.BuildAlgorithm(w)
+	w.Addf(" ", "cv=%s;", cv)
+	s.BuildSignTime(w)
+	s.BuildSignature(w)
+
+	w.Add("\r\n")
+	return w.String(), nil
 }

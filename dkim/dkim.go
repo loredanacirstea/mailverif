@@ -84,8 +84,9 @@ const DKIM_SIGNATURE_HEADER_LOW = "dkim-signature"
 var DKIMSpec = Spec{
 	HeaderName: "DKIM-Signature",
 	// ../rfc/6376:2532
-	RequiredTags:         []string{"v", "a", "b", "bh", "d", "h", "s"},
-	CanonicalizationDef:  "simple/simple",
+	RequiredTags: []string{"v", "a", "b", "bh", "d", "h", "s"},
+	// HeaderCanonicalization: "simple",
+	// BodyCanonicalization:   "simple",
 	PolicySig:            DefaultPolicy,
 	PolicyHeader:         DefaultHeadersPolicy,
 	PolicyParsing:        DefaultParsingPolicy,
@@ -156,7 +157,7 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 	for _, sig := range sigs {
 		sig.Identity = &Identity{&local, domain}
 	}
-	return SignGeneric(sigs, hdrs, nil)
+	return SignGeneric(DKIMSpec, sigs, hdrs, nil)
 }
 
 // Verify parses the DKIM-Signature headers in a message and verifies each of them.
