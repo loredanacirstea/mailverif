@@ -1,10 +1,12 @@
-package arc
+package forward
 
 import (
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/mail"
 	"os"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +28,7 @@ func init() {
 	}
 }
 
-func TestVerifyARC(t *testing.T) {
+func TestVerifyForward(t *testing.T) {
 	pkglog := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	msgr := strings.NewReader(samples.EmailARC1)
 
@@ -34,6 +36,8 @@ func TestVerifyARC(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.NoError(t, results.OriginalDKIM.Err)
+	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 1, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
@@ -41,8 +45,8 @@ func TestVerifyARC(t *testing.T) {
 		require.Equal(t, dkim.StatusPass, v.Dmarc)
 		require.Equal(t, dkim.StatusPass, v.Spf)
 		require.Equal(t, dkim.StatusNone, v.CV)
-		require.True(t, v.AMSValid)
-		require.True(t, v.ASValid)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
 	}
 
 	msgr = strings.NewReader(samples.EmailARC3)
@@ -50,6 +54,8 @@ func TestVerifyARC(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.NoError(t, results.OriginalDKIM.Err)
+	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 3, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
@@ -61,15 +67,14 @@ func TestVerifyARC(t *testing.T) {
 		} else {
 			require.Equal(t, dkim.StatusPass, v.CV)
 		}
-		require.True(t, v.AMSValid)
-		require.True(t, v.ASValid)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
 	}
 }
 
-func TestSignARC(t *testing.T) {
+func TestSignForward(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	r := strings.NewReader(signedMailString)
-	// ed25519Key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	r := strings.NewReader(toForwardEmailString)
 	rsaKey := testutils.GetRSAKey(t)
 	resolver := &DNSResolverTest{}
 	publicKey := &dkim.Record{
@@ -92,19 +97,36 @@ func TestSignARC(t *testing.T) {
 	mailfrom := "joe@football.example.com"
 	ipfrom := "85.215.130.119"
 	mailServerDomain := "example.org"
-	header, err := Sign(logger, resolver, identif, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, false, true, timeNow, publicKey)
-	require.NoError(t, err)
 
-	slices.Reverse(header)
-	newemail := utils.SerializeHeaders(header) + signedMailString
+	from := &mail.Address{Name: "My Name", Address: "myaddress@gmail.com"}
+	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@gmail.com"}}
+	subjectAddl := "additional subject"
+	timestamp := time.Now()
+	var newemail string
+
+	// header, err := dkim.Sign2(logger, identif, domain, selectors, false, r, timeNow)
+	// require.NoError(t, err)
+	// newemail := utils.SerializeHeaders(header) + toForwardEmailString
+	// r = strings.NewReader(newemail)
 
 	// fmt.Println(newemail)
+
+	header, br, err := Forward(logger, resolver, identif, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, publicKey)
+	require.NoError(t, err)
+
+	bodyBytes, err := io.ReadAll(br)
+	require.NoError(t, err)
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
+
+	fmt.Println(newemail)
 
 	msgr := strings.NewReader(newemail)
 	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.NoError(t, results.OriginalDKIM.Err)
+	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 1, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
@@ -112,8 +134,8 @@ func TestSignARC(t *testing.T) {
 		require.Equal(t, dkim.StatusPass, v.Dmarc)
 		require.Equal(t, dkim.StatusPass, v.Spf)
 		require.Equal(t, dkim.StatusNone, v.CV)
-		require.True(t, v.AMSValid)
-		require.True(t, v.ASValid)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
 	}
 }
 
@@ -156,3 +178,7 @@ const signedARCMailString = "ARC-Authentication-Results: i=1; none" + "\r\n" +
  b=kzuq0Ln2l3035rhJQRBzcz1607AmyyBZeMyZaBJ2OcXJA0zwFEv8AMzV6TYwQF9YMcmN5Xah
  DE2PxusJXdenQFTc0Hy9VZ3OzO+fwyCpuZwf5hM+004hl48sRtAeSlRsU13Nfitau2cuNaMH1j2
  RWHzYTMqtDCg6U3MJpbNxDQ4=` + "\r\n" + `ARC-Seal: i=1; a=rsa-sha256; d=example.org; s=brisbane; t=424242; cv=pass; b=DFcsBtLdyGV4cl1vsfiJXNXaHQb9ho1igPXugcMvU1EPYSD2w8rkQ/blQscV1AXTJbdjkp3eHKataSCOwYX/YOfcqsfhJ7lzi/NLjXE3F8sHFMKt7S9BpVQzaprKRz3KXMy2cyia7D4AwgW9cuW5fizdg2TlrAke36QBI1hSGZg=` + "\r\n" + signedMailString
+
+// const toForwardEmailString = “ + "\r\n" + signedMailString
+// const toForwardEmailString = signedMailString
+const toForwardEmailString = mailHeaderString + "\r\n" + mailBodyString

@@ -20,7 +20,6 @@ import (
 	"github.com/loredanacirstea/mailverif/dns"
 	"github.com/loredanacirstea/mailverif/publicsuffix"
 	message "github.com/loredanacirstea/mailverif/utils"
-	moxio "github.com/loredanacirstea/mailverif/utils"
 	smtp "github.com/loredanacirstea/mailverif/utils"
 	utils "github.com/loredanacirstea/mailverif/utils"
 )
@@ -43,6 +42,11 @@ type Spec struct {
 	GetPrefixHeaders     func() []utils.Header
 	ParseSignature       func(header *utils.Header, smtputf8 bool, required []string, parsingPolicy func(ds *Sig, p *Parser, fieldName string) (bool, error), newSig func() *Sig) (sig *Sig, err error)
 	BuildSignatureHeader func(*Sig) (string, error)
+}
+
+type Tag struct {
+	Key   string
+	Value string
 }
 
 // Sig is a signature header for DKIM, ARC and others
@@ -79,7 +83,7 @@ type Sig struct {
 	HeaderFull *utils.Header
 
 	// Everything else (cv, spf, dmarc, …) lives here.
-	Tags []map[string]string
+	Tags [][]Tag
 }
 
 // Identity is used for the optional i= field in a DKIM-Signature header. It uses
@@ -399,7 +403,7 @@ func ParseSignature(
 			ds.CopiedHeaders = p.xcopiedHeaderFields()
 		case "cv":
 			cv := p.StatusValue()
-			ds.Tags = append(ds.Tags, map[string]string{"cv": cv})
+			ds.Tags = append(ds.Tags, []Tag{{"cv", cv}})
 		default:
 			found, err := parsingPolicy(ds, &p, k)
 			if found && err != nil {
@@ -456,7 +460,7 @@ func ParseSignature(
 	return ds, nil
 }
 
-func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bodyOffset int, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, timeNow func() time.Time) (sigs []*Sig, rerr error) {
+func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bodyReader io.Reader, domain dns.Domain, selectors []Selector, smtputf8 bool, timeNow func() time.Time) (sigs []*Sig, rerr error) {
 	for i, s := range selectors {
 		selectors[i] = ApplySpecToSelector(&spec, s)
 	}
@@ -535,7 +539,7 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 		if bh, ok := bodyHashes[hk]; ok {
 			sig.BodyHash = bh
 		} else {
-			br := bufio.NewReader(&moxio.AtReader{R: msg, Offset: int64(bodyOffset)})
+			br := bufio.NewReader(bodyReader)
 			bh, err = BodyHash(h.New(), !sel.BodyRelaxed, br)
 			if err != nil {
 				return nil, err
@@ -548,7 +552,7 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 	return sigs, nil
 }
 
-func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header) (headers []string, rerr error) {
+func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []utils.Header) (headers []utils.Header, rerr error) {
 	for _, sig := range sigs {
 		h, hok := algHash(sig.AlgorithmHash)
 		if !hok {
@@ -597,7 +601,12 @@ func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []ut
 		if err != nil {
 			return nil, err
 		}
-		headers = append(headers, sigh)
+		header := utils.Header{
+			Key:  sig.HeaderFull.Key,
+			LKey: strings.ToLower(sig.HeaderFull.Key),
+			Raw:  []byte(sigh),
+		}
+		headers = append(headers, header)
 	}
 	return headers, nil
 }
@@ -606,7 +615,7 @@ func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []ut
 // 5. Generic Verify ----------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyOffset int, r io.ReaderAt, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
+func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyReader io.Reader, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
 	err := spec.PolicyHeader(hdrs)
 	if err != nil {
 		return nil, err
@@ -631,13 +640,13 @@ func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8
 			continue
 		}
 
-		res := VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, sig, bodyOffset, r, ignoreTest, strictExp, now, rec)
+		res := VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bodyReader, sig, ignoreTest, strictExp, now, rec)
 		results = append(results, res)
 	}
 	return results, nil
 }
 
-func VerifySignatureGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, sig *Sig, bodyOffset int, r io.ReaderAt, ignoreTest, strictExp bool, now func() time.Time, rec *Record) (result Result) {
+func VerifySignatureGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyReader io.Reader, sig *Sig, ignoreTest, strictExp bool, now func() time.Time, rec *Record) (result Result) {
 	hashAlg, canonHdrSimple, canonBodySimple, expired, err := CheckSignatureParamsGeneric(elog, sig, strictExp, now)
 	if err != nil {
 		return Result{StatusPermerror, sig, nil, false, expired, err, 0}
@@ -656,7 +665,7 @@ func VerifySignatureGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver,
 		return Result{StatusPolicy, sig, nil, false, expired, err, 0}
 	}
 
-	br := bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)})
+	br := bufio.NewReader(bodyReader)
 	prefixHeaders := make([]utils.Header, 0)
 	if spec.GetPrefixHeaders != nil {
 		prefixHeaders = spec.GetPrefixHeaders()

@@ -142,15 +142,23 @@ func NewDKIMSigWithDefaults() *Sig {
 	}
 }
 
-// Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
-func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, msg io.ReaderAt, now func() time.Time) ([]string, error) {
-
-	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+func Sign2(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, r io.ReaderAt, now func() time.Time) ([]utils.Header, error) {
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
+		return nil, err
 	}
 
-	sigs, err := BuildSignatureGeneric(elog, DKIMSpec, hdrs, bodyOffset, domain, selectors, smtputf8, msg, now)
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
+	if err != nil {
+		return nil, err
+	}
+
+	return Sign(elog, local, domain, selectors, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), now)
+}
+
+// Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
+func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []Selector, smtputf8 bool, hdrs []utils.Header, bodyReader io.Reader, now func() time.Time) ([]utils.Header, error) {
+	sigs, err := BuildSignatureGeneric(elog, DKIMSpec, hdrs, bodyReader, domain, selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +166,18 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 		sig.Identity = &Identity{&local, domain}
 	}
 	return SignGeneric(DKIMSpec, sigs, hdrs, nil)
+}
+
+func Verify2(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *Record) ([]Result, error) {
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
+	if err != nil {
+		return nil, err
+	}
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
+	if err != nil {
+		return nil, err
+	}
+	return Verify(elog, resolver, smtputf8, policy, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
 }
 
 // Verify parses the DKIM-Signature headers in a message and verifies each of them.
@@ -172,19 +192,14 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 // verification failure is treated as actual failure. With ignoreTestMode
 // false, such verification failures are treated as if there is no signature by
 // returning StatusNone.
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *Record) ([]Result, error) {
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, policy func(*Sig) error, hdrs []utils.Header, bodyReader io.Reader, ignoreTest, strictExpiration bool, now func() time.Time, rec *Record) ([]Result, error) {
 	// allow custom policy override while still using DKIMSpec.
 	spec := DKIMSpec
 	if policy != nil {
 		spec.PolicySig = policy
 	}
 
-	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrHeaderMalformed, err)
-	}
-
-	return VerifyGeneric(elog, spec, resolver, smtputf8, hdrs, bodyOffset, r, ignoreTest, strictExpiration, now, rec)
+	return VerifyGeneric(elog, spec, resolver, smtputf8, hdrs, bodyReader, ignoreTest, strictExpiration, now, rec)
 }
 
 // check if signature is acceptable.

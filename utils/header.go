@@ -8,11 +8,30 @@ import (
 	"strings"
 )
 
+var CRLF = "\r\n"
+
 type Header struct {
 	Key   string // Key in original case.
 	LKey  string // Key in lower-case, for canonical case.
 	Value []byte // Literal header value, possibly spanning multiple lines, not modified in any way, including crlf, excluding leading key and colon.
 	Raw   []byte // Like value, but including original leading key and colon. Ready for use as simple header canonicalized use.
+}
+
+func (h *Header) GetValueTrimmed() string {
+	return strings.Trim(string(h.Value), "\r\n ")
+}
+
+func (h *Header) RebuildRaw() {
+	h.LKey = strings.ToLower(h.Key)
+	h.Raw = []byte(fmt.Sprintf("%s:%s", h.Key, string(h.Value)))
+}
+
+func SerializeHeaders(hdrs []Header) string {
+	raw := ""
+	for _, h := range hdrs {
+		raw += string(h.Raw)
+	}
+	return raw
 }
 
 func ParseHeaders(br *bufio.Reader) ([]Header, int, error) {
@@ -27,7 +46,7 @@ func ParseHeaders(br *bufio.Reader) ([]Header, int, error) {
 			return nil, 0, err
 		}
 		o += len(line)
-		if bytes.Equal(line, []byte("\r\n")) {
+		if bytes.Equal(line, []byte(CRLF)) {
 			break
 		}
 		if line[0] == ' ' || line[0] == '\t' {
@@ -73,7 +92,7 @@ func readline(r *bufio.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if bytes.HasSuffix(line, []byte("\r\n")) {
+		if bytes.HasSuffix(line, []byte(CRLF)) {
 			if len(buf) == 0 {
 				return line, nil
 			}

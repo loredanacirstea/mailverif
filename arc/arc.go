@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/mail"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/loredanacirstea/mailverif/dkim"
+	"github.com/loredanacirstea/mailverif/dmarc"
 	"github.com/loredanacirstea/mailverif/dns"
 	message "github.com/loredanacirstea/mailverif/utils"
 	moxio "github.com/loredanacirstea/mailverif/utils"
@@ -59,9 +61,9 @@ type ArcSetResult struct {
 	CV       dkim.Status `json:"cv"`
 }
 
-type arcSet struct {
-	sigs []*dkim.Sig
-	i    int
+type ArcSet struct {
+	Sigs []*dkim.Sig
+	I    int
 }
 
 var (
@@ -74,12 +76,16 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
+	if err != nil {
+		return nil, err
+	}
 
 	if len(hdrs) == 0 {
 		return &ArcResult{Result: dkim.Result{Status: dkim.StatusNone}}, nil
 	}
 
-	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, bodyOffset, HEADER_NAMES, SPECS, smtputf8, r, ignoreTest, now, rec)
+	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), HEADER_NAMES, SPECS, smtputf8, ignoreTest, now, rec)
 	if err != nil {
 		return &ArcResult{Result: dkim.Result{Status: status, Err: err}}, nil
 	}
@@ -89,27 +95,28 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	// check auth results
 	for _, ress := range results {
 		res := ArcSetResult{Instance: int(ress[0].Sig.Instance)}
-		for _, v := range ress[0].Sig.Tags {
-			for key, value := range v {
-				v := dkim.Status(value)
-				switch key {
+		for _, tags := range ress[0].Sig.Tags {
+			for _, tag := range tags {
+				switch tag.Key {
 				case "dkim":
+					v := dkim.Status(tag.Value)
 					if string(res.Dkim) == "" || v == dkim.StatusPass {
 						res.Dkim = v
 					}
 				case "dmarc":
+					v := dkim.Status(tag.Value)
 					res.Dmarc = v
 				case "spf":
+					v := dkim.Status(tag.Value)
 					res.Spf = v
 				}
 			}
 		}
-		for _, v := range ress[2].Sig.Tags {
-			for key, value := range v {
-				v := dkim.Status(value)
-				switch key {
+		for _, tags := range ress[2].Sig.Tags {
+			for _, tag := range tags {
+				switch tag.Key {
 				case "cv":
-					res.CV = v
+					res.CV = dkim.Status(tag.Value)
 				}
 			}
 		}
@@ -119,7 +126,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	}
 
 	arcResult := func(result dkim.Status, msg string, i int) *ArcResult {
-		return &ArcResult{Result: dkim.Result{Status: dkim.StatusFail, Err: fmt.Errorf("i=%d %s", i, msg), Index: i}, Chain: chain}
+		return &ArcResult{Result: dkim.Result{Status: result, Err: fmt.Errorf("i=%d %s", i, msg), Index: i}, Chain: chain}
 	}
 
 	if !chain[0].AMSValid {
@@ -148,11 +155,15 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain}, nil
 }
 
-// Sign returns line(s) with DKIM-Signature headers, generated according to the configuration.
-func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, now func() time.Time) ([]string, error) {
+func Sign(elog *slog.Logger, resolver dns.Resolver, local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
+	}
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: msg, Offset: int64(bodyOffset)}))
+	if err != nil {
+		return nil, err
 	}
 
 	if len(hdrs) == 0 {
@@ -165,32 +176,43 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 	}
 	instance := len(arcSets) + 1
 
-	signedHeaders := []string{}
+	signedHeaders := []utils.Header{}
 
 	_selectors := make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
-	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+
+	// dkim checks
+	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
+	if err != nil {
+		return nil, err
+	}
+
+	// auth checks
+	from, err := GetFrom(hdrs)
+	if err != nil {
+		return nil, err
+	}
+	headerFrom := strings.Split(from.Address, "@")[1]
+	spfRes, dmarcPass, cv := BuildAuthResults(from, mailfrom, ipfrom, dkimResults, instance, resolver)
+
+	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
 	sigsAuth[0].Instance = int32(instance)
-	// TODO verify & include in sig: dkim, dmarc, spf
-	sigsAuth[0].Tags = []map[string]string{
-		{"authserv-id": "example.org"},
-		{"dkim": "pass", "header.d": "example.org"},
-		{"spf": "pass", "smtp.mailfrom": "joe@football.example.com"},
-		{"dmarc": "pass", "header.from": "football.example.com"},
-	}
+	tags := BuildAuthenticationResultTags(mailServerDomain, mailfrom, headerFrom, dkimResults, spfRes, dmarcPass)
+	sigsAuth[0].Tags = tags
+
 	headers, err := dkim.SignGeneric(AuthResultsSpec, sigsAuth, hdrs, nil)
 	if err != nil {
 		return nil, err
 	}
-	sigsAuth[0].HeaderFull.Raw = []byte(headers[0])
+	sigsAuth[0].HeaderFull.Raw = headers[0].Raw
 	signedHeaders = append(signedHeaders, headers...)
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
-	sigsMS, err := dkim.BuildSignatureGeneric(elog, ArcMessageSignatureSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+	sigsMS, err := dkim.BuildSignatureGeneric(elog, ArcMessageSignatureSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
@@ -199,24 +221,21 @@ func Sign(elog *slog.Logger, local smtp.Localpart, domain dns.Domain, selectors 
 	if err != nil {
 		return nil, err
 	}
-	sigsMS[0].HeaderFull.Raw = []byte(headers[0])
+	sigsMS[0].HeaderFull.Raw = headers[0].Raw
 	signedHeaders = append(signedHeaders, headers...)
 
 	// seal
-	arcSets = append(arcSets, arcSet{sigs: []*dkim.Sig{sigsAuth[0], sigsMS[0]}, i: instance})
-	prefixed := getChainHeaders(arcSets, instance-1)
+	arcSets = append(arcSets, ArcSet{Sigs: []*dkim.Sig{sigsAuth[0], sigsMS[0]}, I: instance})
+	prefixed := GetChainHeaders(arcSets, instance-1)
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
-	sigsAS, err := dkim.BuildSignatureGeneric(elog, ArcSealSpec, hdrs, bodyOffset, domain, _selectors, smtputf8, msg, now)
+	sigsAS, err := dkim.BuildSignatureGeneric(elog, ArcSealSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
 	sigsAS[0].Instance = int32(instance)
-	// TODO
-	sigsAS[0].Tags = []map[string]string{
-		{"cv": "none"},
-	}
+	sigsAS[0].Tags = [][]dkim.Tag{{{Key: "cv", Value: cv}}}
 	headers, err = dkim.SignGeneric(ArcSealSpec, sigsAS, hdrs, prefixed)
 	if err != nil {
 		return nil, err
@@ -339,7 +358,7 @@ func NewSigWithDefaultsArcAuth() *dkim.Sig {
 		Length:           -1,
 		SignTime:         -1,
 		ExpireTime:       -1,
-		Tags:             make([]map[string]string, 0),
+		Tags:             [][]dkim.Tag{},
 	}
 }
 
@@ -367,24 +386,24 @@ func CheckSignatureParamsArcAuth(sig *dkim.Sig) error {
 // Returns all the arc headers up until 'instance', in the correct order.
 // Headers are used to produce arc-seal signature.
 // https://www.rfc-editor.org/rfc/rfc8617.html#section-5.1.1
-func getChainHeaders(arcSets []arcSet, i int) []utils.Header {
+func GetChainHeaders(arcSets []ArcSet, i int) []utils.Header {
 	var res []utils.Header
 	for _, arcSet := range arcSets {
 		res = append(res,
-			*arcSet.sigs[0].HeaderFull, // authResults
-			*arcSet.sigs[1].HeaderFull, // message signature
+			*arcSet.Sigs[0].HeaderFull, // authResults
+			*arcSet.Sigs[1].HeaderFull, // message signature
 		)
 
-		if arcSet.sigs[1].Instance == int32(i+1) {
+		if arcSet.Sigs[1].Instance == int32(i+1) {
 			break
 		}
 		// skip last seal as it's not in the signature
-		res = append(res, *arcSet.sigs[2].HeaderFull)
+		res = append(res, *arcSet.Sigs[2].HeaderFull)
 	}
 	return res
 }
 
-func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []utils.Header, bodyOffset int, headerNames []string, specs []dkim.Spec, smtputf8 bool, r io.ReaderAt, ignoreTest bool, now func() time.Time, rec *dkim.Record) (dkim.Status, [][]dkim.Result, error) {
+func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []utils.Header, bodyReader io.Reader, headerNames []string, specs []dkim.Spec, smtputf8 bool, ignoreTest bool, now func() time.Time, rec *dkim.Record) (dkim.Status, [][]dkim.Result, error) {
 	arcSets, err := ExtractSignatureSets(hdrs, headerNames, specs, smtputf8)
 	if err != nil {
 		return dkim.StatusFail, nil, err
@@ -405,13 +424,13 @@ func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []util
 
 	for i, set := range arcSets {
 		ress := make([]dkim.Result, 0)
-		for x, sig := range set.sigs {
+		for x, sig := range set.Sigs {
 			spec := specs[x]
 			if x == 2 {
 				// arc seal
-				spec.GetPrefixHeaders = func() []utils.Header { return getChainHeaders(arcSets, i) }
+				spec.GetPrefixHeaders = func() []utils.Header { return GetChainHeaders(arcSets, i) }
 			}
-			res := dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, sig, bodyOffset, r, ignoreTest, true, now, rec)
+			res := dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bodyReader, sig, ignoreTest, true, now, rec)
 			ress = append(ress, res)
 		}
 		results = append(results, ress)
@@ -419,13 +438,13 @@ func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []util
 	return dkim.StatusPass, results, nil
 }
 
-func ExtractSignatureSets(headers []utils.Header, headerNames []string, spec []dkim.Spec, smtputf8 bool) ([]arcSet, error) {
+func ExtractSignatureSets(headers []utils.Header, headerNames []string, spec []dkim.Spec, smtputf8 bool) ([]ArcSet, error) {
 	specMap := map[string]dkim.Spec{}
 	for i, h := range headerNames {
 		headerNames[i] = strings.ToLower(h)
 		specMap[headerNames[i]] = spec[i]
 	}
-	sets := make([]arcSet, 0)
+	sets := make([]ArcSet, 0)
 	instance := 1
 	hl := len(headerNames)
 
@@ -451,13 +470,13 @@ func ExtractSignatureSets(headers []utils.Header, headerNames []string, spec []d
 		l := len(sets)
 		index := instance - 1
 		if instance > l {
-			sets = append(sets, arcSet{i: instance, sigs: make([]*dkim.Sig, hl)})
+			sets = append(sets, ArcSet{I: instance, Sigs: make([]*dkim.Sig, hl)})
 		}
 		x := slices.Index(headerNames, sig.HeaderFull.LKey)
 
-		sets[index].sigs[x] = sig
+		sets[index].Sigs[x] = sig
 		if x+1 == hl {
-			for _, s := range sets[index].sigs {
+			for _, s := range sets[index].Sigs {
 				if s == nil {
 					return nil, ErrMissingArcFields
 				}
@@ -550,7 +569,7 @@ func ParseSignatureAuthResults(
 	}
 
 	seen["authserv-id"] = struct{}{}
-	ds.Tags = append(ds.Tags, map[string]string{"authserv-id": authServID})
+	ds.Tags = append(ds.Tags, []dkim.Tag{{Key: "authserv-id", Value: authServID}})
 	ds.Tags = append(ds.Tags, results...)
 
 	// ../rfc/6376:2532
@@ -570,8 +589,8 @@ func ParseSignatureAuthResults(
 //
 // It relies *exclusively* on the generic DKIM Parser so we get identical FWS
 // handling and error semantics.
-func parseAuthResultSetsFromParser(p *dkim.Parser) ([]map[string]string, error) {
-	var sets []map[string]string
+func parseAuthResultSetsFromParser(p *dkim.Parser) ([][]dkim.Tag, error) {
+	var sets [][]dkim.Tag
 
 loopClauses:
 	for {
@@ -586,7 +605,7 @@ loopClauses:
 			break // nothing more
 		}
 
-		clause := make(map[string]string)
+		clause := make([]dkim.Tag, 0)
 
 		// <method>=<result>
 		method := strings.ToLower(p.StatusValue()) // XHyphenatedWord
@@ -597,7 +616,7 @@ loopClauses:
 		// result token (pass / fail / neutral / none …)
 		// StatusValue XHyphenatedWord
 		res := strings.ToLower(p.StatusValue())
-		clause[method] = res
+		clause = append(clause, dkim.Tag{Key: method, Value: res})
 		p.Fws()
 
 		// optional comment:  “( … )”
@@ -608,7 +627,7 @@ loopClauses:
 				msg.WriteRune(p.XChar())
 			}
 			p.XTake(")")
-			clause["message"] = "(" + msg.String() + ")"
+			clause = append(clause, dkim.Tag{Key: "message", Value: "(" + msg.String() + ")"})
 			p.Fws()
 		}
 
@@ -625,7 +644,7 @@ loopClauses:
 			for !p.Empty() && !(p.HasPrefix(";") || p.HasPrefix(" ") || p.HasPrefix("\t")) {
 				val.WriteRune(p.XChar())
 			}
-			clause[key] = val.String()
+			clause = append(clause, dkim.Tag{Key: key, Value: val.String()})
 			p.Fws()
 		}
 
@@ -642,14 +661,14 @@ loopClauses:
 	return sets, nil
 }
 
-func buildAuthResult(v map[string]string) string {
+func buildAuthResult(v []dkim.Tag) string {
 	val := ""
-	for k, v := range v {
-		if k == "message" {
-			val += " " + v
+	for _, v := range v {
+		if v.Key == "message" {
+			val += " " + v.Value
 			break
 		}
-		val += " " + k + "=" + v
+		val += " " + v.Key + "=" + v.Value
 	}
 	return val
 }
@@ -657,20 +676,19 @@ func buildAuthResult(v map[string]string) string {
 func BuildHeaderAuth(s *dkim.Sig) (string, error) {
 	authServID := ""
 	results := []string{}
+Outer:
 	for _, t := range s.Tags {
-		v, ok := t["authserv-id"]
-		if ok {
-			authServID = v
-			continue
+		for _, v := range t {
+			if v.Key == "authserv-id" {
+				authServID = v.Value
+				continue Outer
+			}
 		}
 		results = append(results, buildAuthResult(t))
 	}
 
 	w := &message.HeaderWriter{}
 	w.Addf("", "%s: i=%d; %s;", s.HeaderFull.Key, s.Instance, authServID)
-	// w.Addf(" ", "%s;", dkim)
-	// w.Addf(" ", "%s;", spf)
-	// w.Addf(" ", "%s", dmarc)
 	w.Addf("", "%s", strings.Join(results, ";"))
 	w.Add("\r\n")
 	return w.String(), nil
@@ -698,11 +716,13 @@ func BuildHeaderMS(s *dkim.Sig) (string, error) {
 
 func BuildHeaderAS(s *dkim.Sig) (string, error) {
 	cv := ""
+Outer:
 	for _, t := range s.Tags {
-		v, ok := t["cv"]
-		if ok {
-			cv = v
-			break
+		for _, v := range t {
+			if v.Key == "cv" {
+				cv = v.Value
+				continue Outer
+			}
 		}
 	}
 
@@ -719,4 +739,90 @@ func BuildHeaderAS(s *dkim.Sig) (string, error) {
 
 	w.Add("\r\n")
 	return w.String(), nil
+}
+
+func GetFrom(hdrs []utils.Header) (*mail.Address, error) {
+	for _, h := range hdrs {
+		if h.LKey == "from" {
+			return mail.ParseAddress(strings.Trim(string(h.Value), " \n\r"))
+		}
+	}
+	return nil, fmt.Errorf("missing From header")
+}
+
+func BuildAuthResults(from *mail.Address, mailfrom string, ipfrom string, dkimResults []dkim.Result, instance int, resolver dns.Resolver) (spfRes dmarc.AuthResult, dmarcPass bool, cv string) {
+	var err error
+	mailfromDomain := strings.Split(mailfrom, "@")[1]
+	headerFrom := strings.Split(from.Address, "@")[1]
+
+	// Mark the DKIM result as pass if at least one signature passes
+	// and aligns with the From domain (or satisfies relaxed alignment for DMARC).
+	dkimpass := false
+	dkimRes := make([]dmarc.AuthResult, len(dkimResults))
+	for i, v := range dkimResults {
+		dkimRes[i] = dmarc.AuthResult{Domain: v.Sig.Domain.String(), Valid: v.Err == nil}
+		if v.Err == nil {
+			dkimpass = true
+		}
+	}
+
+	spfRes, err = dmarc.CheckSPF(mailfromDomain, ipfrom, resolver.LookupTXT)
+	if err != nil {
+		fmt.Println("SPF failed:", err)
+		spfRes.Valid = false
+	}
+
+	// run dmarc tests on domain from header "From"
+	dmarcPass = false
+	dmarcRecord, err := dmarc.LookupWithOptions(headerFrom, resolver.LookupTXT)
+	if err != nil {
+		fmt.Println("DMARC failed:", err)
+		dmarcPass = false
+	} else {
+		dmarcPass, dkimpass = dmarc.CheckDMARC(headerFrom, dmarcRecord, spfRes, dkimRes, dkimpass)
+	}
+
+	cv = "none"
+	if instance > 1 {
+		if dmarcPass && spfRes.Valid && dkimpass {
+			cv = "pass"
+		} else {
+			cv = "fail"
+		}
+	}
+	return spfRes, dmarcPass, cv
+}
+
+func BuildAuthenticationResultTags(mailServerDomain string, mailfrom string, headerFrom string, dkimResults []dkim.Result, spfRes dmarc.AuthResult, dmarcPass bool) [][]dkim.Tag {
+	tags := [][]dkim.Tag{}
+	tags = append(tags, []dkim.Tag{{Key: "authserv-id", Value: mailServerDomain}})
+
+	for _, v := range dkimResults {
+		tag := []dkim.Tag{
+			{Key: "dkim", Value: string(v.Status)},
+			{Key: "header.d", Value: v.Sig.Domain.String()},
+		}
+		tags = append(tags, tag)
+	}
+
+	spfStatus := dkim.StatusFail
+	if spfRes.Valid {
+		spfStatus = dkim.StatusPass
+	}
+	tag := []dkim.Tag{
+		{Key: "spf", Value: string(spfStatus)},
+		{Key: "smtp.mailfrom", Value: mailfrom},
+	}
+	tags = append(tags, tag)
+
+	dmarcStatus := dkim.StatusFail
+	if dmarcPass {
+		dmarcStatus = dkim.StatusPass
+	}
+	tag = []dkim.Tag{
+		{Key: "dmarc", Value: string(dmarcStatus)},
+		{Key: "header.from", Value: headerFrom},
+	}
+	tags = append(tags, tag)
+	return tags
 }

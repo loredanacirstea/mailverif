@@ -177,3 +177,11 @@ func IsNotFound(err error) bool {
 	errmsg := err.Error()
 	return strings.Contains(errmsg, errNoSuchHost) || strings.Contains(errmsg, errUnknownPort) || strings.Contains(errmsg, "no record")
 }
+
+func IsTemporaryErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	errmsg := err.Error()
+	return strings.Contains(errmsg, "temporary") || strings.Contains(errmsg, "timeout")
+}
