@@ -17,7 +17,6 @@ import (
 	"github.com/loredanacirstea/mailverif/dns"
 	message "github.com/loredanacirstea/mailverif/utils"
 	moxio "github.com/loredanacirstea/mailverif/utils"
-	smtp "github.com/loredanacirstea/mailverif/utils"
 	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
@@ -168,7 +167,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 
 func Forward(
 	elog *slog.Logger, resolver dns.Resolver,
-	local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector,
+	domain dns.Domain, selectors []dkim.Selector,
 	smtputf8 bool,
 	msg io.ReaderAt,
 	mailfrom string, ipfrom string, mailServerDomain string,
@@ -195,7 +194,7 @@ func Forward(
 
 	hdrs = BuildForwardHeaders(elog, msg, hdrs, from, to, cc, bcc, subject, timestamp, instance)
 
-	addlHeaders, err := Sign(elog, resolver, local, domain, selectors, smtputf8, hdrs, rawBody, mailfrom, ipfrom, mailServerDomain, ignoreTest, strictExpiration, now, rec)
+	addlHeaders, err := Sign(elog, resolver, domain, selectors, smtputf8, hdrs, rawBody, mailfrom, ipfrom, mailServerDomain, ignoreTest, strictExpiration, now, rec)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,7 +203,7 @@ func Forward(
 	return append(addlHeaders, hdrs...), br, nil
 }
 
-func Sign(elog *slog.Logger, resolver dns.Resolver, local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, hdrs []utils.Header, rawBody []byte, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, hdrs []utils.Header, rawBody []byte, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
 	if len(hdrs) == 0 {
 		return nil, fmt.Errorf("no headers")

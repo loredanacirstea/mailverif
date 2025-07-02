@@ -17,7 +17,6 @@ import (
 	"github.com/loredanacirstea/mailverif/dns"
 	message "github.com/loredanacirstea/mailverif/utils"
 	moxio "github.com/loredanacirstea/mailverif/utils"
-	smtp "github.com/loredanacirstea/mailverif/utils"
 	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
@@ -155,7 +154,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain}, nil
 }
 
-func Sign(elog *slog.Logger, resolver dns.Resolver, local smtp.Localpart, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
 	if err != nil {

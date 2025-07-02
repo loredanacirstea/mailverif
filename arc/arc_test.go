@@ -81,7 +81,6 @@ func TestSignARC(t *testing.T) {
 		Pubkey:    rsaKey.PublicKey.N.Bytes(),
 	}
 
-	identif := utils.Localpart("joe")
 	domain := dns.Domain{ASCII: "example.org"}
 	sel := dkim.Selector{
 		Hash:       "sha256",
@@ -92,7 +91,7 @@ func TestSignARC(t *testing.T) {
 	mailfrom := "joe@football.example.com"
 	ipfrom := "85.215.130.119"
 	mailServerDomain := "example.org"
-	header, err := Sign(logger, resolver, identif, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, false, true, timeNow, publicKey)
+	header, err := Sign(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 
 	slices.Reverse(header)

@@ -86,7 +86,6 @@ func TestSignForward(t *testing.T) {
 		Pubkey:    rsaKey.PublicKey.N.Bytes(),
 	}
 
-	identif := utils.Localpart("joe")
 	domain := dns.Domain{ASCII: "example.org"}
 	sel := dkim.Selector{
 		Hash:       "sha256",
@@ -111,7 +110,7 @@ func TestSignForward(t *testing.T) {
 
 	// fmt.Println(newemail)
 
-	header, br, err := Forward(logger, resolver, identif, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, publicKey)
+	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 
 	bodyBytes, err := io.ReadAll(br)
