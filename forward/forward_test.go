@@ -1,6 +1,11 @@
 package forward
 
 import (
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,16 +81,24 @@ func TestSignForward(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	r := strings.NewReader(toForwardEmailString)
 	rsaKey := testutils.GetRSAKey(t)
-	resolver := &DNSResolverTest{}
-	publicKey := &dkim.Record{
+	recordOrig := &dkim.Record{
+		Version:   "DKIM1",
+		Key:       "rsa",
+		Hashes:    []string{"sha256"},
+		Services:  []string{"email"},
+		PublicKey: &testPrivateKey.PublicKey,
+		Pubkey:    testPrivateKey.PublicKey.N.Bytes(),
+		Flags:     []string{"s"},
+	}
+	record := &dkim.Record{
 		Version:   "DKIM1",
 		Key:       "rsa",
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &rsaKey.PublicKey,
 		Pubkey:    rsaKey.PublicKey.N.Bytes(),
+		Flags:     []string{"s"},
 	}
-
 	domain := dns.Domain{ASCII: "example.org"}
 	sel := dkim.Selector{
 		Hash:       "sha256",
@@ -94,23 +107,47 @@ func TestSignForward(t *testing.T) {
 	}
 	selectors := []dkim.Selector{sel}
 	mailfrom := "joe@football.example.com"
-	ipfrom := "85.215.130.119"
-	mailServerDomain := "example.org"
+	ipfrom := "127.0.0.1"
 
-	from := &mail.Address{Name: "My Name", Address: "myaddress@gmail.com"}
-	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@gmail.com"}}
+	txtOrig, err := recordOrig.Record()
+	if err != nil {
+		t.Fatalf("making dns txt record: %s", err)
+	}
+	// txt, err := record.Record()
+	// if err != nil {
+	// 	t.Fatalf("making dns txt record: %s", err)
+	// }
+	resolver := dns.MockResolver{
+		TXT: map[string][]string{
+			// DMARC
+			"_dmarc.brisbane.example.org": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@brisbane.example.org!10m"},
+			"_dmarc.football.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@football.example.com!10m"},
+
+			// SPF
+			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s -all", ipfrom)},
+
+			// DKIM
+			// "joe._domainkey.football.example.com.":      {txt},
+			"brisbane._domainkey.football.example.com.": {txtOrig},
+			// "test._domainkey.football.example.com.":     {txt},
+		},
+	}
+
+	from := &mail.Address{Name: "My Name", Address: "myaddress@brisbane.example.org"}
+	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@brisbane.example.org"}}
 	subjectAddl := "additional subject"
 	timestamp := time.Now()
 	var newemail string
 
-	// header, err := dkim.Sign2(logger, identif, domain, selectors, false, r, timeNow)
-	// require.NoError(t, err)
-	// newemail := utils.SerializeHeaders(header) + toForwardEmailString
-	// r = strings.NewReader(newemail)
+	// verify original DKIM signature
+	resultsDkim, err := dkim.Verify2(logger, resolver, false, dkim.DefaultPolicy, r, false, true, timeNow, recordOrig)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(resultsDkim))
+	require.NoError(t, resultsDkim[0].Err)
+	require.Equal(t, dkim.StatusPass, resultsDkim[0].Status)
 
-	// fmt.Println(newemail)
-
-	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, publicKey)
+	// prepare forwarded email & add forward headers
+	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err := io.ReadAll(br)
@@ -120,7 +157,7 @@ func TestSignForward(t *testing.T) {
 	fmt.Println(newemail)
 
 	msgr := strings.NewReader(newemail)
-	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, publicKey)
+	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
@@ -179,5 +216,45 @@ const signedARCMailString = "ARC-Authentication-Results: i=1; none" + "\r\n" +
  RWHzYTMqtDCg6U3MJpbNxDQ4=` + "\r\n" + `ARC-Seal: i=1; a=rsa-sha256; d=example.org; s=brisbane; t=424242; cv=pass; b=DFcsBtLdyGV4cl1vsfiJXNXaHQb9ho1igPXugcMvU1EPYSD2w8rkQ/blQscV1AXTJbdjkp3eHKataSCOwYX/YOfcqsfhJ7lzi/NLjXE3F8sHFMKt7S9BpVQzaprKRz3KXMy2cyia7D4AwgW9cuW5fizdg2TlrAke36QBI1hSGZg=` + "\r\n" + signedMailString
 
 // const toForwardEmailString = “ + "\r\n" + signedMailString
-// const toForwardEmailString = signedMailString
-const toForwardEmailString = mailHeaderString + "\r\n" + mailBodyString
+const toForwardEmailString = signedMailString
+
+// const toForwardEmailString = mailHeaderString + "\r\n" + mailBodyString
+
+const testPrivateKeyPEM = `-----BEGIN RSA PRIVATE KEY-----
+MIICXwIBAAKBgQDwIRP/UC3SBsEmGqZ9ZJW3/DkMoGeLnQg1fWn7/zYtIxN2SnFC
+jxOCKG9v3b4jYfcTNh5ijSsq631uBItLa7od+v/RtdC2UzJ1lWT947qR+Rcac2gb
+to/NMqJ0fzfVjH4OuKhitdY9tf6mcwGjaNBcWToIMmPSPDdQPNUYckcQ2QIDAQAB
+AoGBALmn+XwWk7akvkUlqb+dOxyLB9i5VBVfje89Teolwc9YJT36BGN/l4e0l6QX
+/1//6DWUTB3KI6wFcm7TWJcxbS0tcKZX7FsJvUz1SbQnkS54DJck1EZO/BLa5ckJ
+gAYIaqlA9C0ZwM6i58lLlPadX/rtHb7pWzeNcZHjKrjM461ZAkEA+itss2nRlmyO
+n1/5yDyCluST4dQfO8kAB3toSEVc7DeFeDhnC1mZdjASZNvdHS4gbLIA1hUGEF9m
+3hKsGUMMPwJBAPW5v/U+AWTADFCS22t72NUurgzeAbzb1HWMqO4y4+9Hpjk5wvL/
+eVYizyuce3/fGke7aRYw/ADKygMJdW8H/OcCQQDz5OQb4j2QDpPZc0Nc4QlbvMsj
+7p7otWRO5xRa6SzXqqV3+F0VpqvDmshEBkoCydaYwc2o6WQ5EBmExeV8124XAkEA
+qZzGsIxVP+sEVRWZmW6KNFSdVUpk3qzK0Tz/WjQMe5z0UunY9Ax9/4PVhp/j61bf
+eAYXunajbBSOLlx4D+TunwJBANkPI5S9iylsbLs6NkaMHV6k5ioHBBmgCak95JGX
+GMot/L2x0IYyMLAz6oLWh2hm7zwtb0CgOrPo1ke44hFYnfc=
+-----END RSA PRIVATE KEY-----
+`
+
+const testEd25519SeedBase64 = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A="
+
+var (
+	testPrivateKey        *rsa.PrivateKey
+	testEd25519PrivateKey ed25519.PrivateKey
+)
+
+func init() {
+	block, _ := pem.Decode([]byte(testPrivateKeyPEM))
+	var err error
+	testPrivateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+
+	ed25519Seed, err := base64.StdEncoding.DecodeString(testEd25519SeedBase64)
+	if err != nil {
+		panic(err)
+	}
+	testEd25519PrivateKey = ed25519.NewKeyFromSeed(ed25519Seed)
+}

@@ -90,8 +90,7 @@ func TestSignARC(t *testing.T) {
 	selectors := []dkim.Selector{sel}
 	mailfrom := "joe@football.example.com"
 	ipfrom := "85.215.130.119"
-	mailServerDomain := "example.org"
-	header, err := Sign(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, mailServerDomain, false, true, timeNow, publicKey)
+	header, err := Sign(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 
 	slices.Reverse(header)

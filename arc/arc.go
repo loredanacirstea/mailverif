@@ -154,7 +154,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain}, nil
 }
 
-func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
 	if err != nil {
@@ -199,7 +199,7 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 		return nil, err
 	}
 	sigsAuth[0].Instance = int32(instance)
-	tags := BuildAuthenticationResultTags(mailServerDomain, mailfrom, headerFrom, dkimResults, spfRes, dmarcPass)
+	tags := BuildAuthenticationResultTags(domain, mailfrom, headerFrom, dkimResults, spfRes, dmarcPass)
 	sigsAuth[0].Tags = tags
 
 	headers, err := dkim.SignGeneric(AuthResultsSpec, sigsAuth, hdrs, nil)
@@ -792,9 +792,9 @@ func BuildAuthResults(from *mail.Address, mailfrom string, ipfrom string, dkimRe
 	return spfRes, dmarcPass, cv
 }
 
-func BuildAuthenticationResultTags(mailServerDomain string, mailfrom string, headerFrom string, dkimResults []dkim.Result, spfRes dmarc.AuthResult, dmarcPass bool) [][]dkim.Tag {
+func BuildAuthenticationResultTags(domain dns.Domain, mailfrom string, headerFrom string, dkimResults []dkim.Result, spfRes dmarc.AuthResult, dmarcPass bool) [][]dkim.Tag {
 	tags := [][]dkim.Tag{}
-	tags = append(tags, []dkim.Tag{{Key: "authserv-id", Value: mailServerDomain}})
+	tags = append(tags, []dkim.Tag{{Key: "authserv-id", Value: domain.String()}})
 
 	for _, v := range dkimResults {
 		tag := []dkim.Tag{

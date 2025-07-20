@@ -170,13 +170,13 @@ func Forward(
 	domain dns.Domain, selectors []dkim.Selector,
 	smtputf8 bool,
 	msg io.ReaderAt,
-	mailfrom string, ipfrom string, mailServerDomain string,
+	mailfrom string, ipfrom string,
 	from *mail.Address, to []*mail.Address, cc []*mail.Address, bcc []*mail.Address,
 	subject string, timestamp time.Time,
 	ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record,
 ) ([]utils.Header, io.Reader, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
-	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+	hdrsOriginal, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
@@ -184,32 +184,34 @@ func Forward(
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// TODO dont repeat code
-	arcSets, err := arc.ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
+	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp)
 	if err != nil {
 		return nil, nil, err
 	}
-	instance := len(arcSets) + 1
 
-	hdrs = BuildForwardHeaders(elog, msg, hdrs, from, to, cc, bcc, subject, timestamp, instance)
-
-	addlHeaders, err := Sign(elog, resolver, domain, selectors, smtputf8, hdrs, rawBody, mailfrom, ipfrom, mailServerDomain, ignoreTest, strictExpiration, now, rec)
+	addlHeaders, err := Sign(elog, resolver, domain, selectors, smtputf8, hdrsOriginal, hdrsForward, rawBody, mailfrom, ipfrom, ignoreTest, strictExpiration, now, rec)
 	if err != nil {
 		return nil, nil, err
 	}
-	slices.Reverse(addlHeaders)
 	br := bufio.NewReader(bytes.NewReader(rawBody))
-	return append(addlHeaders, hdrs...), br, nil
+	return AppendForwardHeaders(hdrsForward, addlHeaders), br, nil
 }
 
-func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, hdrs []utils.Header, rawBody []byte, mailfrom string, ipfrom string, mailServerDomain string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+func AppendForwardHeaders(hdrs []utils.Header, addlHeaders []utils.Header) []utils.Header {
+	slices.Reverse(addlHeaders)
+	return append(addlHeaders, hdrs...)
+}
+
+func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, hdrsOriginal []utils.Header, hdrsForward []utils.Header, rawBody []byte, mailfrom string, ipfrom string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
-	if len(hdrs) == 0 {
-		return nil, fmt.Errorf("no headers")
+	if len(hdrsOriginal) == 0 {
+		return nil, fmt.Errorf("no original headers")
+	}
+	if len(hdrsForward) == 0 {
+		return nil, fmt.Errorf("no forwarded headers")
 	}
 
-	arcSets, err := arc.ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
+	arcSets, err := arc.ExtractSignatureSets(hdrsOriginal, HEADER_NAMES, SPECS, smtputf8)
 	if err != nil {
 		return nil, err
 	}
@@ -221,28 +223,28 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	copy(_selectors, selectors)
 
 	// dkim checks
-	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
+	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrsOriginal, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
 	if err != nil {
 		return nil, err
 	}
 
 	// auth checks
-	from, err := arc.GetFrom(hdrs)
+	from, err := arc.GetFrom(hdrsOriginal)
 	if err != nil {
 		return nil, err
 	}
 	headerFrom := strings.Split(from.Address, "@")[1]
 	spfRes, dmarcPass, cv := arc.BuildAuthResults(from, mailfrom, ipfrom, dkimResults, instance, resolver)
 
-	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
+	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrsForward, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
 	sigsAuth[0].Instance = int32(instance)
-	tags := arc.BuildAuthenticationResultTags(mailServerDomain, mailfrom, headerFrom, dkimResults, spfRes, dmarcPass)
+	tags := arc.BuildAuthenticationResultTags(domain, mailfrom, headerFrom, dkimResults, spfRes, dmarcPass)
 	sigsAuth[0].Tags = tags
 
-	headers, err := dkim.SignGeneric(AuthResultsSpec, sigsAuth, hdrs, nil)
+	headers, err := dkim.SignGeneric(AuthResultsSpec, sigsAuth, hdrsForward, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -251,14 +253,14 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
-	sigsMS, err := dkim.BuildSignatureGeneric(elog, ForwardSignatureSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
+	sigsMS, err := dkim.BuildSignatureGeneric(elog, ForwardSignatureSpec, hdrsForward, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
 	sigsMS[0].Instance = int32(instance)
 	sigsMS[0].Tags = append(sigsMS[0].Tags, []dkim.Tag{{Key: FIELD_DNS_REGISTRY, Value: DNS_REGISTRY}})
 	sigsMS[0].Tags = append(sigsMS[0].Tags, []dkim.Tag{{Key: FIELD_EMAIL_REGISTRY, Value: EMAIL_REGISTRY}})
-	headers, err = dkim.SignGeneric(ForwardSignatureSpec, sigsMS, hdrs, nil)
+	headers, err = dkim.SignGeneric(ForwardSignatureSpec, sigsMS, hdrsForward, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -271,13 +273,13 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
-	sigsAS, err := dkim.BuildSignatureGeneric(elog, SealSpec, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
+	sigsAS, err := dkim.BuildSignatureGeneric(elog, SealSpec, hdrsForward, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
 	}
 	sigsAS[0].Instance = int32(instance)
 	sigsAS[0].Tags = [][]dkim.Tag{{{Key: "cv", Value: cv}}}
-	headers, err = dkim.SignGeneric(SealSpec, sigsAS, hdrs, prefixed)
+	headers, err = dkim.SignGeneric(SealSpec, sigsAS, hdrsForward, prefixed)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +465,28 @@ func BuildHeaderAS(s *dkim.Sig) (string, error) {
 
 func BuildForwardHeaders(
 	elog *slog.Logger,
+	smtputf8 bool,
+	originalEmail io.ReaderAt,
+	hdrs []utils.Header,
+	from *mail.Address,
+	to []*mail.Address,
+	cc []*mail.Address,
+	bcc []*mail.Address,
+	subjectAddl string,
+	timestamp time.Time,
+) ([]utils.Header, error) {
+	arcSets, err := arc.ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
+	if err != nil {
+		return nil, err
+	}
+	instance := len(arcSets) + 1
+
+	hdrs = BuildForwardHeadersInternal(elog, originalEmail, hdrs, from, to, cc, bcc, subjectAddl, timestamp, instance)
+	return hdrs, nil
+}
+
+func BuildForwardHeadersInternal(
+	elog *slog.Logger,
 	originalEmail io.ReaderAt,
 	hdrs []utils.Header,
 	from *mail.Address,
@@ -505,9 +529,10 @@ func BuildForwardHeaders(
 	// we replace these headers
 	for _, h := range hdrs2 {
 		changed := true
+		originalValue := h.GetValueTrimmed()
 		switch h.LKey {
 		case HEADER_LOW_SUBJECT:
-			h.Value = []byte(" Re: " + h.GetValueTrimmed() + ": " + subjectAddl + utils.CRLF) // TODO add from.toAddress()
+			h.Value = []byte(" Re: " + originalValue + ": " + subjectAddl + utils.CRLF) // TODO add from.toAddress()
 		case HEADER_LOW_IN_REPLY_TO:
 			h.Value = []byte(" " + messageId + utils.CRLF) // with <>
 		case HEADER_LOW_REFERENCES: // TODO add all previous references
@@ -533,7 +558,7 @@ func BuildForwardHeaders(
 
 		if slices.Contains(updatedHeaders, h.Key) {
 			if _, ok := dkimCtxParams[h.LKey]; !ok {
-				dkimCtxParams[h.LKey] = h.GetValueTrimmed()
+				dkimCtxParams[h.LKey] = originalValue
 			}
 		}
 
