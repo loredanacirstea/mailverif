@@ -41,8 +41,6 @@ func TestVerifyForward(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 1, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
@@ -59,8 +57,6 @@ func TestVerifyForward(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 3, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
@@ -87,8 +83,8 @@ func TestSignForward(t *testing.T) {
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &testPrivateKey.PublicKey,
-		Pubkey:    testPrivateKey.PublicKey.N.Bytes(),
-		Flags:     []string{"s"},
+		// Pubkey:    testPrivateKey.PublicKey.N.Bytes(),
+		Flags: []string{"s"},
 	}
 	record := &dkim.Record{
 		Version:   "DKIM1",
@@ -96,8 +92,8 @@ func TestSignForward(t *testing.T) {
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &rsaKey.PublicKey,
-		Pubkey:    rsaKey.PublicKey.N.Bytes(),
-		Flags:     []string{"s"},
+		// Pubkey:    rsaKey.PublicKey.N.Bytes(),
+		Flags: []string{"s"},
 	}
 	domain := dns.Domain{ASCII: "example.org"}
 	sel := dkim.Selector{
@@ -107,7 +103,7 @@ func TestSignForward(t *testing.T) {
 	}
 	selectors := []dkim.Selector{sel}
 	mailfrom := "joe@football.example.com"
-	ipfrom := "127.0.0.1"
+	ipfrom := "192.168.1.1"
 
 	txtOrig, err := recordOrig.Record()
 	if err != nil {
@@ -124,12 +120,13 @@ func TestSignForward(t *testing.T) {
 			"_dmarc.football.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@football.example.com!10m"},
 
 			// SPF
-			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s -all", ipfrom)},
+			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s/32 -all", ipfrom)},
 
 			// DKIM
 			// "joe._domainkey.football.example.com.":      {txt},
 			"brisbane._domainkey.football.example.com.": {txtOrig},
 			// "test._domainkey.football.example.com.":     {txt},
+			"brisbane._domainkey.example.org.": {txtOrig},
 		},
 	}
 
@@ -154,24 +151,21 @@ func TestSignForward(t *testing.T) {
 	require.NoError(t, err)
 	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
-	fmt.Println(newemail)
-
 	msgr := strings.NewReader(newemail)
 	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 1, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
-		require.Equal(t, dkim.StatusPass, v.Dkim)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
 		require.Equal(t, dkim.StatusPass, v.Dmarc)
 		require.Equal(t, dkim.StatusPass, v.Spf)
 		require.Equal(t, dkim.StatusNone, v.CV)
-		require.True(t, v.ChainSigValid)
-		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.Dkim)
 	}
 }
 

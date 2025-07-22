@@ -78,7 +78,6 @@ func TestSignARC(t *testing.T) {
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &rsaKey.PublicKey,
-		Pubkey:    rsaKey.PublicKey.N.Bytes(),
 	}
 
 	domain := dns.Domain{ASCII: "example.org"}

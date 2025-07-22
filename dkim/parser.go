@@ -508,6 +508,19 @@ func (p *Parser) xztagcopy() string {
 	return f + ":" + v
 }
 
+func (p *Parser) XRawUntil(delim string) string {
+	start := p.o
+	for !p.empty() {
+		if strings.HasPrefix(p.s[p.o:], delim) {
+			break
+		}
+		p.o++
+	}
+	value := p.s[start:p.o]
+	p.track(value)
+	return strings.TrimSpace(value)
+}
+
 // ---- exports -----
 
 func NewParser(s string, smtputf8 bool) Parser {

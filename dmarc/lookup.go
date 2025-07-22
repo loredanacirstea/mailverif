@@ -40,7 +40,6 @@ func LookupWithOptions(domain string, LookupTXT TxtLookupFunc) (*Record, error) 
 		return nil, errors.New("no LookupTXT provided")
 	}
 	txts, _, err = LookupTXT("_dmarc." + domain)
-	fmt.Println("--LookupWithOptions txts--", domain, err)
 
 	if err != nil {
 		if dns.IsNotFound(err) {
