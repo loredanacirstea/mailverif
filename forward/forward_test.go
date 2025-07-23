@@ -144,7 +144,7 @@ func TestSignForward(t *testing.T) {
 	require.Equal(t, dkim.StatusPass, resultsDkim[0].Status)
 
 	// prepare forwarded email & add forward headers
-	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, record)
+	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err := io.ReadAll(br)
@@ -167,6 +167,68 @@ func TestSignForward(t *testing.T) {
 		require.Equal(t, dkim.StatusNone, v.CV)
 		require.Equal(t, dkim.StatusPass, v.Dkim)
 	}
+
+	// i=2
+	from = &mail.Address{Name: "Some Name", Address: "someaddress@brisbane.example.org"}
+	to = []*mail.Address{{Name: "Some Name2", Address: "someaddress2@brisbane.example.org"}}
+	subjectAddl = "additional subject2"
+	timestamp = time.Now()
+	// prepare forwarded email & add forward headers
+	r = strings.NewReader(newemail)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	require.NoError(t, err)
+
+	bodyBytes, err = io.ReadAll(br)
+	require.NoError(t, err)
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
+
+	msgr = strings.NewReader(newemail)
+	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	require.NoError(t, err)
+	require.NoError(t, results.Result.Err)
+	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.Equal(t, 2, len(results.Chain))
+	for i, v := range results.Chain {
+		require.Equal(t, i+1, v.Instance)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
+		require.Equal(t, dkim.StatusPass, v.Dmarc)
+		require.Equal(t, dkim.StatusPass, v.Spf)
+		require.Equal(t, dkim.StatusNone, v.CV)
+		require.Equal(t, dkim.StatusPass, v.Dkim)
+	}
+
+	// i=3
+	from = &mail.Address{Name: "Some Name2", Address: "someaddress2@brisbane.example.org"}
+	to = []*mail.Address{{Name: "Some Name3", Address: "someaddress3@brisbane.example.org"}}
+	subjectAddl = "additional subject3"
+	timestamp = time.Now()
+	// prepare forwarded email & add forward headers
+	r = strings.NewReader(newemail)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	require.NoError(t, err)
+
+	bodyBytes, err = io.ReadAll(br)
+	require.NoError(t, err)
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
+
+	msgr = strings.NewReader(newemail)
+	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	require.NoError(t, err)
+	require.NoError(t, results.Result.Err)
+	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.Equal(t, 3, len(results.Chain))
+	for i, v := range results.Chain {
+		require.Equal(t, i+1, v.Instance)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
+		require.Equal(t, dkim.StatusPass, v.Dmarc)
+		require.Equal(t, dkim.StatusPass, v.Spf)
+		require.Equal(t, dkim.StatusNone, v.CV)
+		require.Equal(t, dkim.StatusPass, v.Dkim)
+	}
 }
 
 type DNSResolverTest struct{}
@@ -174,6 +236,11 @@ type DNSResolverTest struct{}
 func (r *DNSResolverTest) LookupTXT(name string) ([]string, dns.Result, error) {
 	res, err := net.LookupTXT(name)
 	return res, dns.Result{Authentic: true}, err
+}
+
+func generateMessageId() string {
+	v := time.Now().UnixNano()
+	return fmt.Sprintf("%d.5F8J@football.example.com", v)
 }
 
 const mailHeaderString = "From: Joe SixPack <joe@football.example.com>\r\n" +

@@ -143,10 +143,6 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 		return &ArcResult{Result: dkim.Result{Status: result, Err: fmt.Errorf("i=%d %s", i, msg), Index: i}, Chain: chain}
 	}
 
-	if !chain[0].ChainSigValid {
-		return arcResult(dkim.StatusFail, "Most recent Provable-Forward-Signature did not validate", chain[0].Instance), nil
-	}
-
 	// Validate results
 	//
 	//	"The "cv" value for all ARC-Seal header fields MUST NOT be
@@ -155,14 +151,16 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	//	value MUST be "none"."
 	for _, res := range chain {
 		switch {
-		case res.CV == dkim.StatusFail:
-			return arcResult(dkim.StatusFail, "ARC-Seal reported failure, the chain is terminated", res.Instance), nil
 		case !res.ChainSigValid:
-			return arcResult(dkim.StatusFail, "ARC-Seal did not validate", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s did not validate", HEADER_FORWARD_SIG), res.Instance), nil
+		case !res.ChainSealValid:
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s did not validate", HEADER_FORWARD_SEAL), res.Instance), nil
+		case res.CV == dkim.StatusFail:
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv failed", HEADER_FORWARD_SEAL), res.Instance), nil
 		case (res.Instance == 1) && (res.CV != dkim.StatusNone):
-			return arcResult(dkim.StatusFail, "ARC-Seal reported invalid status", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv should be none", HEADER_FORWARD_SEAL), res.Instance), nil
 		case (res.Instance > 1) && (res.CV != dkim.StatusPass):
-			return arcResult(dkim.StatusFail, "ARC-Seal reported invalid status", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv should pass", HEADER_FORWARD_SEAL), res.Instance), nil
 		}
 	}
 
@@ -176,7 +174,7 @@ func Forward(
 	msg io.ReaderAt,
 	mailfrom string, ipfrom string,
 	from *mail.Address, to []*mail.Address, cc []*mail.Address, bcc []*mail.Address,
-	subject string, timestamp time.Time,
+	subject string, timestamp time.Time, messageId string,
 	ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record,
 ) ([]utils.Header, io.Reader, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
@@ -188,7 +186,7 @@ func Forward(
 	if err != nil {
 		return nil, nil, err
 	}
-	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp)
+	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp, messageId)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -274,8 +272,9 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	signedHeaders = append(signedHeaders, headers...)
 
 	// forward chain seal header
-	arcSets = append(arcSets, arc.ArcSet{Sigs: []*dkim.Sig{sigsAuth[0], sigsMS[0]}, I: instance})
-	prefixed := arc.GetChainHeaders(arcSets, instance-1)
+	// fill in nil for dkim context, as it is not needed for signing the forward chain seal
+	arcSets = append(arcSets, arc.ArcSet{Sigs: []*dkim.Sig{nil, sigsAuth[0], sigsMS[0]}, I: instance})
+	prefixed := GetChainHeaders(arcSets, instance-1)
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
@@ -625,6 +624,7 @@ func BuildForwardHeaders(
 	bcc []*mail.Address,
 	subjectAddl string,
 	timestamp time.Time,
+	messageId string,
 ) ([]utils.Header, error) {
 	arcSets, err := arc.ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
 	if err != nil {
@@ -632,7 +632,7 @@ func BuildForwardHeaders(
 	}
 	instance := len(arcSets) + 1
 
-	hdrs = BuildForwardHeadersInternal(elog, originalEmail, hdrs, from, to, cc, bcc, subjectAddl, timestamp, instance)
+	hdrs = BuildForwardHeadersInternal(elog, originalEmail, hdrs, from, to, cc, bcc, subjectAddl, timestamp, messageId, instance)
 	return hdrs, nil
 }
 
@@ -646,6 +646,7 @@ func BuildForwardHeadersInternal(
 	bcc []*mail.Address,
 	subjectAddl string,
 	timestamp time.Time,
+	newmessageId string,
 	instance int,
 ) []utils.Header {
 	// changed headers
@@ -672,9 +673,13 @@ func BuildForwardHeadersInternal(
 		case HEADER_LOW_MESSAGE_ID:
 			messageId = h.GetValueTrimmed() // with <>
 			dkimCtxParams[HEADER_MESSAGE_ID] = messageId
-		default:
-			hdrs2 = append(hdrs2, h)
+			h = utils.Header{
+				Key:   HEADER_MESSAGE_ID,
+				Value: []byte(fmt.Sprintf(" <%s>\r\n", newmessageId)),
+			}
+			h.RebuildRaw()
 		}
+		hdrs2 = append(hdrs2, h)
 	}
 
 	// we replace these headers
@@ -912,7 +917,7 @@ func extractInstanceFromHeader(h utils.Header) int {
 	return 0
 }
 
-func GetChainHeaders(arcSets []arc.ArcSet, i int) []utils.Header {
+func GetChainHeaders(arcSets []arc.ArcSet, index int) []utils.Header {
 	var res []utils.Header
 	for _, arcSet := range arcSets {
 		res = append(res,
@@ -920,7 +925,7 @@ func GetChainHeaders(arcSets []arc.ArcSet, i int) []utils.Header {
 			*arcSet.Sigs[SigNdx].HeaderFull,  // message signature
 		)
 
-		if arcSet.Sigs[SigNdx].Instance == int32(i+1) {
+		if arcSet.Sigs[SigNdx].Instance == int32(index+1) {
 			break
 		}
 		// skip last seal as it's not in the signature
