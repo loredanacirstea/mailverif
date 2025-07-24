@@ -1,6 +1,7 @@
 package arc
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -28,7 +29,7 @@ func init() {
 
 func TestVerifyARC(t *testing.T) {
 	pkglog := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	msgr := strings.NewReader(samples.EmailARC1)
+	msgr := []byte(samples.EmailARC1)
 
 	results, err := Verify(pkglog, &DNSResolverTest{}, false, msgr, false, true, timeNow, nil)
 	require.NoError(t, err)
@@ -45,7 +46,7 @@ func TestVerifyARC(t *testing.T) {
 		require.True(t, v.ASValid)
 	}
 
-	msgr = strings.NewReader(samples.EmailARC3)
+	msgr = []byte(samples.EmailARC3)
 	results, err = Verify(pkglog, &DNSResolverTest{}, false, msgr, false, true, timeNow, nil)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
@@ -68,10 +69,8 @@ func TestVerifyARC(t *testing.T) {
 
 func TestSignARC(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	r := strings.NewReader(signedMailString)
-	// ed25519Key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	initialEmail := mailString
 	rsaKey := testutils.GetRSAKey(t)
-	resolver := &DNSResolverTest{}
 	publicKey := &dkim.Record{
 		Version:   "DKIM1",
 		Key:       "rsa",
@@ -80,7 +79,7 @@ func TestSignARC(t *testing.T) {
 		PublicKey: &rsaKey.PublicKey,
 	}
 
-	domain := dns.Domain{ASCII: "example.org"}
+	domain := dns.Domain{ASCII: "example.com"}
 	sel := dkim.Selector{
 		Hash:       "sha256",
 		PrivateKey: rsaKey,
@@ -89,15 +88,48 @@ func TestSignARC(t *testing.T) {
 	selectors := []dkim.Selector{sel}
 	mailfrom := "joe@football.example.com"
 	ipfrom := "85.215.130.119"
-	header, err := Sign(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, false, true, timeNow, publicKey)
+
+	txtOrig, err := publicKey.Record()
+	if err != nil {
+		t.Fatalf("making dns txt record: %s", err)
+	}
+	resolver := dns.MockResolver{
+		TXT: map[string][]string{
+			// DMARC
+			"_dmarc.brisbane.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@brisbane.example.com!10m"},
+			"_dmarc.football.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@football.example.com!10m"},
+
+			// SPF
+			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s/32 -all", ipfrom)},
+
+			// DKIM
+			"brisbane._domainkey.football.example.com.": {txtOrig},
+			"brisbane._domainkey.example.com.":          {txtOrig},
+		},
+	}
+	dkimSel := dkim.Selector{
+		Hash:       "sha256",
+		PrivateKey: rsaKey,
+		Domain:     dns.Domain{ASCII: "brisbane"},
+
+		Headers:     strings.Split("From,To,Cc,Bcc,Reply-To,Subject,Date", ","),
+		SealHeaders: true,
+	}
+	// first sign dkim
+	dkimH, err := dkim.Sign2(logger, "joe", domain, []dkim.Selector{dkimSel}, false, []byte(initialEmail), timeNow)
+	require.NoError(t, err)
+
+	// compute new email
+	initialEmail = utils.SerializeHeaders(dkimH) + initialEmail
+
+	// sign ARC
+	header, err := Sign(logger, resolver, domain, selectors, false, []byte(initialEmail), mailfrom, ipfrom, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 
 	slices.Reverse(header)
-	newemail := utils.SerializeHeaders(header) + signedMailString
+	newemail := utils.SerializeHeaders(header) + initialEmail
 
-	// fmt.Println(newemail)
-
-	msgr := strings.NewReader(newemail)
+	msgr := []byte(newemail)
 	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, publicKey)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
