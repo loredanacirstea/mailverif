@@ -1,6 +1,8 @@
 package forward
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
@@ -18,7 +20,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	samples "github.com/loredanacirstea/mailverif/_samples"
 	testutils "github.com/loredanacirstea/mailverif/_testutils"
 	"github.com/loredanacirstea/mailverif/dkim"
 	"github.com/loredanacirstea/mailverif/dns"
@@ -33,53 +34,9 @@ func init() {
 	}
 }
 
-func TestVerifyForward(t *testing.T) {
-	pkglog := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	msgr := strings.NewReader(samples.EmailARC1)
-
-	results, err := Verify(pkglog, &DNSResolverTest{}, false, msgr, false, true, timeNow, nil)
-	require.NoError(t, err)
-	require.NoError(t, results.Result.Err)
-	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
-	require.Equal(t, 1, len(results.Chain))
-	for i, v := range results.Chain {
-		require.Equal(t, i+1, v.Instance)
-		require.Equal(t, dkim.StatusPass, v.Dkim)
-		require.Equal(t, dkim.StatusPass, v.Dmarc)
-		require.Equal(t, dkim.StatusPass, v.Spf)
-		require.Equal(t, dkim.StatusNone, v.CV)
-		require.True(t, v.ChainSigValid)
-		require.True(t, v.ChainSealValid)
-	}
-
-	msgr = strings.NewReader(samples.EmailARC3)
-	results, err = Verify(pkglog, &DNSResolverTest{}, false, msgr, false, true, timeNow, nil)
-	require.NoError(t, err)
-	require.NoError(t, results.Result.Err)
-	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
-	require.Equal(t, 3, len(results.Chain))
-	for i, v := range results.Chain {
-		require.Equal(t, i+1, v.Instance)
-		require.Equal(t, dkim.StatusPass, v.Dkim)
-		require.Equal(t, dkim.StatusPass, v.Dmarc)
-		require.Equal(t, dkim.StatusPass, v.Spf)
-		if i == 0 {
-			require.Equal(t, dkim.StatusNone, v.CV)
-		} else {
-			require.Equal(t, dkim.StatusPass, v.CV)
-		}
-		require.True(t, v.ChainSigValid)
-		require.True(t, v.ChainSealValid)
-	}
-}
-
 func TestSignForward(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	r := strings.NewReader(toForwardEmailString)
+	initialEmail := mailString
 	rsaKey := testutils.GetRSAKey(t)
 	recordOrig := &dkim.Record{
 		Version:   "DKIM1",
@@ -87,7 +44,6 @@ func TestSignForward(t *testing.T) {
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &testPrivateKey.PublicKey,
-		Pubkey:    testPrivateKey.PublicKey.N.Bytes(),
 		Flags:     []string{"s"},
 	}
 	record := &dkim.Record{
@@ -96,10 +52,9 @@ func TestSignForward(t *testing.T) {
 		Hashes:    []string{"sha256"},
 		Services:  []string{"email"},
 		PublicKey: &rsaKey.PublicKey,
-		Pubkey:    rsaKey.PublicKey.N.Bytes(),
 		Flags:     []string{"s"},
 	}
-	domain := dns.Domain{ASCII: "example.org"}
+	domain := dns.Domain{ASCII: "football.example.com"}
 	sel := dkim.Selector{
 		Hash:       "sha256",
 		PrivateKey: rsaKey,
@@ -107,71 +62,169 @@ func TestSignForward(t *testing.T) {
 	}
 	selectors := []dkim.Selector{sel}
 	mailfrom := "joe@football.example.com"
-	ipfrom := "127.0.0.1"
+	ipfrom := "192.168.1.1"
 
 	txtOrig, err := recordOrig.Record()
 	if err != nil {
 		t.Fatalf("making dns txt record: %s", err)
 	}
-	// txt, err := record.Record()
-	// if err != nil {
-	// 	t.Fatalf("making dns txt record: %s", err)
-	// }
 	resolver := dns.MockResolver{
 		TXT: map[string][]string{
 			// DMARC
-			"_dmarc.brisbane.example.org": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@brisbane.example.org!10m"},
+			"_dmarc.brisbane.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@brisbane.example.com!10m"},
 			"_dmarc.football.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@football.example.com!10m"},
 
 			// SPF
-			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s -all", ipfrom)},
+			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s/32 -all", ipfrom)},
 
 			// DKIM
-			// "joe._domainkey.football.example.com.":      {txt},
 			"brisbane._domainkey.football.example.com.": {txtOrig},
-			// "test._domainkey.football.example.com.":     {txt},
+			"brisbane._domainkey.example.com.":          {txtOrig},
 		},
 	}
+	dkimSel := dkim.Selector{
+		Hash:       "sha256",
+		PrivateKey: testPrivateKey,
+		Domain:     dns.Domain{ASCII: "brisbane"},
 
-	from := &mail.Address{Name: "My Name", Address: "myaddress@brisbane.example.org"}
-	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@brisbane.example.org"}}
+		Headers:     strings.Split("From,To,Cc,Bcc,Reply-To,Subject,Date", ","),
+		SealHeaders: true,
+	}
+
+	// sign initial email dkim
+	dkimH, err := dkim.Sign2(logger, "joe", domain, []dkim.Selector{dkimSel}, false, []byte(initialEmail), timeNow)
+	require.NoError(t, err)
+
+	// compute new email
+	initialEmail = utils.SerializeHeaders(dkimH) + initialEmail
+	r := strings.NewReader(initialEmail)
+
+	from := &mail.Address{Name: "My Name", Address: "myaddress@football.example.com"}
+	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@football.example.com"}}
 	subjectAddl := "additional subject"
-	timestamp := time.Now()
+	timestamp := time.Date(2025, time.July, 10, 10, 3, 0, 0, time.UTC)
 	var newemail string
 
 	// verify original DKIM signature
-	resultsDkim, err := dkim.Verify2(logger, resolver, false, dkim.DefaultPolicy, r, false, true, timeNow, recordOrig)
+	resultsDkim, err := dkim.Verify2(logger, resolver, false, dkim.DefaultPolicy, []byte(initialEmail), true, false, true, timeNow, recordOrig)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(resultsDkim))
 	require.NoError(t, resultsDkim[0].Err)
 	require.Equal(t, dkim.StatusPass, resultsDkim[0].Status)
 
 	// prepare forwarded email & add forward headers
-	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, false, true, timeNow, record)
+	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err := io.ReadAll(br)
 	require.NoError(t, err)
-	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
-	fmt.Println(newemail)
+	// also add dkim signature for this instance
+	dkimHeaders, err := dkim.Sign(logger, "myaddress", domain, []dkim.Selector{dkimSel}, false, header, bufio.NewReader(bytes.NewReader(bodyBytes)), timeNow)
+	require.NoError(t, err)
+	header = append(dkimHeaders, header...)
+
+	// compute new email
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
 	msgr := strings.NewReader(newemail)
 	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
-	require.NoError(t, results.OriginalDKIM.Err)
-	require.Equal(t, dkim.StatusPass, results.OriginalDKIM.Status)
 	require.Equal(t, 1, len(results.Chain))
 	for i, v := range results.Chain {
 		require.Equal(t, i+1, v.Instance)
-		require.Equal(t, dkim.StatusPass, v.Dkim)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
 		require.Equal(t, dkim.StatusPass, v.Dmarc)
 		require.Equal(t, dkim.StatusPass, v.Spf)
 		require.Equal(t, dkim.StatusNone, v.CV)
+		require.Equal(t, dkim.StatusPass, v.Dkim)
+	}
+
+	// i=2
+	mailfrom = "myaddress@football.example.com"
+	from = &mail.Address{Name: "Some Name", Address: "someaddress@football.example.com"}
+	to = []*mail.Address{{Name: "Some Name2", Address: "someaddress2@football.example.com"}}
+	subjectAddl = "additional subject2"
+	timestamp = time.Date(2025, time.July, 11, 10, 3, 0, 0, time.UTC)
+	// prepare forwarded email & add forward headers
+	r = strings.NewReader(newemail)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	require.NoError(t, err)
+
+	bodyBytes, err = io.ReadAll(br)
+	require.NoError(t, err)
+
+	// also add dkim signature for this instance
+	dkimHeaders, err = dkim.Sign(logger, "someaddress", domain, []dkim.Selector{dkimSel}, false, header, bufio.NewReader(bytes.NewReader(bodyBytes)), timeNow)
+	require.NoError(t, err)
+	header = append(dkimHeaders, header...)
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
+
+	msgr = strings.NewReader(newemail)
+	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	require.NoError(t, err)
+	require.NoError(t, results.Result.Err)
+	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.Equal(t, 2, len(results.Chain))
+	for i, v := range results.Chain {
+		require.Equal(t, i+1, v.Instance)
 		require.True(t, v.ChainSigValid)
 		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
+		require.Equal(t, dkim.StatusPass, v.Dmarc)
+		require.Equal(t, dkim.StatusPass, v.Spf)
+		if i == 0 {
+			require.Equal(t, dkim.StatusNone, v.CV)
+		} else {
+			require.Equal(t, dkim.StatusPass, v.CV)
+		}
+		require.Equal(t, dkim.StatusPass, v.Dkim)
+	}
+
+	// i=3
+	mailfrom = "someaddress@football.example.com"
+	from = &mail.Address{Name: "Some Name2", Address: "someaddress2@football.example.com"}
+	to = []*mail.Address{{Name: "Some Name3", Address: "someaddress3@football.example.com"}}
+	subjectAddl = "additional subject3"
+	timestamp = time.Date(2025, time.July, 12, 10, 3, 0, 0, time.UTC)
+	// prepare forwarded email & add forward headers
+	r = strings.NewReader(newemail)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	require.NoError(t, err)
+
+	bodyBytes, err = io.ReadAll(br)
+	require.NoError(t, err)
+
+	// also add dkim signature for this instance
+	dkimHeaders, err = dkim.Sign(logger, "someaddress2", domain, []dkim.Selector{dkimSel}, false, header, bufio.NewReader(bytes.NewReader(bodyBytes)), timeNow)
+	require.NoError(t, err)
+	header = append(dkimHeaders, header...)
+
+	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
+
+	msgr = strings.NewReader(newemail)
+	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	require.NoError(t, err)
+	require.NoError(t, results.Result.Err)
+	require.Equal(t, dkim.StatusPass, results.Result.Status)
+	require.Equal(t, 3, len(results.Chain))
+	for i, v := range results.Chain {
+		require.Equal(t, i+1, v.Instance)
+		require.True(t, v.ChainSigValid)
+		require.True(t, v.ChainSealValid)
+		require.Equal(t, dkim.StatusPass, v.DkimSource)
+		require.Equal(t, dkim.StatusPass, v.Dmarc)
+		require.Equal(t, dkim.StatusPass, v.Spf)
+		if i == 0 {
+			require.Equal(t, dkim.StatusNone, v.CV)
+		} else {
+			require.Equal(t, dkim.StatusPass, v.CV)
+		}
+		require.Equal(t, dkim.StatusPass, v.Dkim)
 	}
 }
 
@@ -180,6 +233,11 @@ type DNSResolverTest struct{}
 func (r *DNSResolverTest) LookupTXT(name string) ([]string, dns.Result, error) {
 	res, err := net.LookupTXT(name)
 	return res, dns.Result{Authentic: true}, err
+}
+
+func generateMessageId() string {
+	v := time.Now().UnixNano()
+	return fmt.Sprintf("%d.5F8J@football.example.com", v)
 }
 
 const mailHeaderString = "From: Joe SixPack <joe@football.example.com>\r\n" +
@@ -216,7 +274,7 @@ const signedARCMailString = "ARC-Authentication-Results: i=1; none" + "\r\n" +
  RWHzYTMqtDCg6U3MJpbNxDQ4=` + "\r\n" + `ARC-Seal: i=1; a=rsa-sha256; d=example.org; s=brisbane; t=424242; cv=pass; b=DFcsBtLdyGV4cl1vsfiJXNXaHQb9ho1igPXugcMvU1EPYSD2w8rkQ/blQscV1AXTJbdjkp3eHKataSCOwYX/YOfcqsfhJ7lzi/NLjXE3F8sHFMKt7S9BpVQzaprKRz3KXMy2cyia7D4AwgW9cuW5fizdg2TlrAke36QBI1hSGZg=` + "\r\n" + signedMailString
 
 // const toForwardEmailString = “ + "\r\n" + signedMailString
-const toForwardEmailString = signedMailString
+// const toForwardEmailString = signedMailString
 
 // const toForwardEmailString = mailHeaderString + "\r\n" + mailBodyString
 

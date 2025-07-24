@@ -87,8 +87,7 @@ test
 		},
 	}
 
-	r := strings.NewReader(message)
-	results, err := Verify2(pkglog, resolver, false, policyOK, r, false, true, timeNow, nil)
+	results, err := Verify2(pkglog, resolver, false, policyOK, []byte(message), false, false, true, timeNow, nil)
 	if err != nil {
 		t.Fatalf("dkim verify: %v", err)
 	}
@@ -135,8 +134,7 @@ Joe.
 		},
 	}
 
-	r := strings.NewReader(message)
-	results, err := Verify2(pkglog, resolver, false, policyOK, r, false, true, timeNow, nil)
+	results, err := Verify2(pkglog, resolver, false, policyOK, []byte(message), false, false, true, timeNow, nil)
 	if err != nil {
 		t.Fatalf("dkim verify: %v", err)
 	}
@@ -199,7 +197,7 @@ test
 	}
 	selectors := []Selector{selrsa, selrsa2, seled25519, seled25519b}
 
-	r := strings.NewReader(message)
+	r := []byte(message)
 	newhdrs, err := Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
@@ -231,9 +229,7 @@ test
 	}
 
 	nmsg := headers + message
-
-	nr := strings.NewReader(nmsg)
-	results, err := Verify2(pkglog, resolver, false, policyOK, nr, false, true, timeNow, nil)
+	results, err := Verify2(pkglog, resolver, false, policyOK, []byte(nmsg), false, false, true, timeNow, nil)
 	if err != nil {
 		t.Fatalf("verify: %s", err)
 	}
@@ -244,39 +240,39 @@ test
 	// log.Infof("nmsg\n%s", nmsg)
 
 	// Multiple From headers.
-	r = strings.NewReader("From: <mjl@mox.example>\r\nFrom: <mjl@mox.example>\r\n\r\ntest")
+	r = []byte("From: <mjl@mox.example>\r\nFrom: <mjl@mox.example>\r\n\r\ntest")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrFrom) {
 		t.Fatalf("sign, got err %v, expected ErrFrom", err)
 	}
 
 	// No From header.
-	r = strings.NewReader("Brom: <mjl@mox.example>\r\n\r\ntest")
+	r = []byte("Brom: <mjl@mox.example>\r\n\r\ntest")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrFrom) {
 		t.Fatalf("sign, got err %v, expected ErrFrom", err)
 	}
 
 	// Malformed headers.
-	r = strings.NewReader(":\r\n\r\ntest")
+	r = []byte(":\r\n\r\ntest")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrHeaderMalformed) {
 		t.Fatalf("sign, got err %v, expected ErrHeaderMalformed", err)
 	}
 
-	r = strings.NewReader(" From:<mjl@mox.example>\r\n\r\ntest")
+	r = []byte(" From:<mjl@mox.example>\r\n\r\ntest")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrHeaderMalformed) {
 		t.Fatalf("sign, got err %v, expected ErrHeaderMalformed", err)
 	}
 
-	r = strings.NewReader("Frøm:<mjl@mox.example>\r\n\r\ntest")
+	r = []byte("Frøm:<mjl@mox.example>\r\n\r\ntest")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrHeaderMalformed) {
 		t.Fatalf("sign, got err %v, expected ErrHeaderMalformed", err)
 	}
 
-	r = strings.NewReader("From:<mjl@mox.example>")
+	r = []byte("From:<mjl@mox.example>")
 	_, err = Sign2(pkglog, "mjl", dns.Domain{ASCII: "mox.example"}, selectors, false, r, timeNow)
 	if !errors.Is(err, ErrHeaderMalformed) {
 		t.Fatalf("sign, got err %v, expected ErrHeaderMalformed", err)
@@ -351,7 +347,7 @@ test
 		t.Helper()
 
 		msg = strings.ReplaceAll(msg, "\n", "\r\n")
-		r := strings.NewReader(msg)
+		r := []byte(msg)
 		newhdrs, err := Sign2(pkglog, "mjl", signDomain, selectors, false, r, timeNow)
 		if err != nil {
 			t.Fatalf("sign: %v", err)
@@ -370,8 +366,7 @@ test
 			sign()
 		}
 
-		r := strings.NewReader(msg)
-		results, err := Verify2(pkglog, resolver, true, policy, r, false, true, timeNow, nil)
+		results, err := Verify2(pkglog, resolver, true, policy, []byte(msg), false, false, true, timeNow, nil)
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) {
 			t.Fatalf("got verify error %v, expected %v", err, expErr)
 		}

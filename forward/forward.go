@@ -3,12 +3,15 @@ package forward
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/mail"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,21 +24,18 @@ import (
 )
 
 const (
-	FORWARD_AUTH_HEADER            = "Provable-Authentication-Results"
-	HEADER_FORWARD_DNS_REGISTRY    = "Provable-DNS-Registry"
-	HEADER_FORWARD_EMAIL_REGISTRY  = "Provable-Email-Registry"
-	HEADER_FORWARD_ORIGIN_DKIM_CTX = "Provable-Forward-Origin-DKIM-Context"
-	HEADER_FORWARD_SIG             = "Provable-Forward-Signature"
-	HEADER_FORWARD_SEAL            = "Provable-Forward-Seal"
+	HEADER_FORWARD_PREFIX   = "Provable-"
+	FORWARD_AUTH_HEADER     = "Provable-Authentication-Results"
+	HEADER_FORWARD_DKIM_CTX = "Provable-Forward-DKIM-Context"
+	HEADER_FORWARD_SIG      = "Provable-Forward-Signature"
+	HEADER_FORWARD_SEAL     = "Provable-Forward-Seal"
 )
 
 var (
-	FORWARD_AUTH_HEADER_LOWER            = strings.ToLower(FORWARD_AUTH_HEADER)
-	HEADER_FORWARD_DNS_REGISTRY_LOWER    = strings.ToLower(HEADER_FORWARD_DNS_REGISTRY)
-	HEADER_FORWARD_EMAIL_REGISTRY_LOWER  = strings.ToLower(HEADER_FORWARD_EMAIL_REGISTRY)
-	HEADER_FORWARD_ORIGIN_DKIM_CTX_LOWER = strings.ToLower(HEADER_FORWARD_ORIGIN_DKIM_CTX)
-	HEADER_FORWARD_SIG_LOWER             = strings.ToLower(HEADER_FORWARD_SIG)
-	HEADER_FORWARD_SEAL_LOWER            = strings.ToLower(HEADER_FORWARD_SEAL)
+	FORWARD_AUTH_HEADER_LOWER     = strings.ToLower(FORWARD_AUTH_HEADER)
+	HEADER_FORWARD_DKIM_CTX_LOWER = strings.ToLower(HEADER_FORWARD_DKIM_CTX)
+	HEADER_FORWARD_SIG_LOWER      = strings.ToLower(HEADER_FORWARD_SIG)
+	HEADER_FORWARD_SEAL_LOWER     = strings.ToLower(HEADER_FORWARD_SEAL)
 )
 
 var (
@@ -56,8 +56,7 @@ var (
 
 type ArcResult struct {
 	// Final result of verification
-	Result       dkim.Result
-	OriginalDKIM dkim.Result `json:"original-dkim"`
+	Result dkim.Result
 
 	// Result data at each part of the chain until failure
 	Chain []ArcSetResult `json:"chain"`
@@ -72,11 +71,17 @@ type ArcSetResult struct {
 	CV             dkim.Status `json:"cv"`
 	ChainSigValid  bool        `json:"forward-chain-signature-valid"`
 	ChainSealValid bool        `json:"forward-chain-seal-valid"`
+	DkimSource     dkim.Status `json:"dkim_source"`
 }
 
 var (
-	HEADER_NAMES = []string{FORWARD_AUTH_HEADER, HEADER_FORWARD_SIG, HEADER_FORWARD_SEAL}
-	SPECS        = []dkim.Spec{AuthResultsSpec, ForwardSignatureSpec, SealSpec}
+	HEADER_NAMES  = []string{HEADER_FORWARD_DKIM_CTX, FORWARD_AUTH_HEADER, HEADER_FORWARD_SIG, HEADER_FORWARD_SEAL}
+	SPECS         = []dkim.Spec{DkimCtxSpec, AuthResultsSpec, ForwardSignatureSpec, SealSpec}
+	DkimCtxNdx    = 0
+	AuthNdx       = 1
+	SigNdx        = 2
+	ChainNdx      = 3
+	DkimSourceNdx = 4
 )
 
 func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
@@ -92,20 +97,18 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	if len(hdrs) == 0 {
 		return &ArcResult{Result: dkim.Result{Status: dkim.StatusNone}}, nil
 	}
-	// TODO verify HEADER_FORWARD_ORIGIN_DKIM_CTX
-	originDKIM := dkim.Result{Status: dkim.StatusPass}
 
-	status, results, err := arc.VerifySignaturesBasic(elog, resolver, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), HEADER_NAMES, SPECS, smtputf8, ignoreTest, now, rec)
+	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, rawBody, HEADER_NAMES, SPECS, smtputf8, ignoreTest, now, rec)
 	if err != nil {
-		return &ArcResult{Result: dkim.Result{Status: status, Err: err}, OriginalDKIM: originDKIM}, nil
+		return &ArcResult{Result: dkim.Result{Status: status, Err: err}}, nil
 	}
 
 	chain := []ArcSetResult{}
 
 	// check auth results
 	for _, ress := range results {
-		res := ArcSetResult{Instance: int(ress[0].Sig.Instance)}
-		for _, tags := range ress[0].Sig.Tags {
+		res := ArcSetResult{Instance: int(ress[AuthNdx].Sig.Instance)}
+		for _, tags := range ress[AuthNdx].Sig.Tags {
 			for _, tag := range tags {
 				switch tag.Key {
 				case "dkim":
@@ -122,7 +125,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 				}
 			}
 		}
-		for _, tags := range ress[2].Sig.Tags {
+		for _, tags := range ress[ChainNdx].Sig.Tags {
 			for _, tag := range tags {
 				switch tag.Key {
 				case "cv":
@@ -130,17 +133,14 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 				}
 			}
 		}
-		res.ChainSigValid = ress[1].Status == dkim.StatusPass
-		res.ChainSealValid = ress[2].Status == dkim.StatusPass
+		res.ChainSigValid = ress[SigNdx].Status == dkim.StatusPass
+		res.ChainSealValid = ress[ChainNdx].Status == dkim.StatusPass
+		res.DkimSource = ress[DkimSourceNdx].Status
 		chain = append(chain, res)
 	}
 
 	arcResult := func(result dkim.Status, msg string, i int) *ArcResult {
-		return &ArcResult{Result: dkim.Result{Status: result, Err: fmt.Errorf("i=%d %s", i, msg), Index: i}, Chain: chain, OriginalDKIM: originDKIM}
-	}
-
-	if !chain[0].ChainSigValid {
-		return arcResult(dkim.StatusFail, "Most recent Provable-Forward-Signature did not validate", chain[0].Instance), nil
+		return &ArcResult{Result: dkim.Result{Status: result, Err: fmt.Errorf("i=%d %s", i, msg), Index: i}, Chain: chain}
 	}
 
 	// Validate results
@@ -151,18 +151,20 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	//	value MUST be "none"."
 	for _, res := range chain {
 		switch {
-		case res.CV == dkim.StatusFail:
-			return arcResult(dkim.StatusFail, "ARC-Seal reported failure, the chain is terminated", res.Instance), nil
 		case !res.ChainSigValid:
-			return arcResult(dkim.StatusFail, "ARC-Seal did not validate", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s did not validate", HEADER_FORWARD_SIG), res.Instance), nil
+		case !res.ChainSealValid:
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s did not validate", HEADER_FORWARD_SEAL), res.Instance), nil
+		case res.CV == dkim.StatusFail:
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv failed", HEADER_FORWARD_SEAL), res.Instance), nil
 		case (res.Instance == 1) && (res.CV != dkim.StatusNone):
-			return arcResult(dkim.StatusFail, "ARC-Seal reported invalid status", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv should be none", HEADER_FORWARD_SEAL), res.Instance), nil
 		case (res.Instance > 1) && (res.CV != dkim.StatusPass):
-			return arcResult(dkim.StatusFail, "ARC-Seal reported invalid status", res.Instance), nil
+			return arcResult(dkim.StatusFail, fmt.Sprintf("%s: cv should pass", HEADER_FORWARD_SEAL), res.Instance), nil
 		}
 	}
 
-	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain, OriginalDKIM: originDKIM}, nil
+	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain}, nil
 }
 
 func Forward(
@@ -172,7 +174,7 @@ func Forward(
 	msg io.ReaderAt,
 	mailfrom string, ipfrom string,
 	from *mail.Address, to []*mail.Address, cc []*mail.Address, bcc []*mail.Address,
-	subject string, timestamp time.Time,
+	subject string, timestamp time.Time, messageId string,
 	ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record,
 ) ([]utils.Header, io.Reader, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
@@ -184,7 +186,7 @@ func Forward(
 	if err != nil {
 		return nil, nil, err
 	}
-	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp)
+	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp, messageId)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -223,7 +225,7 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	copy(_selectors, selectors)
 
 	// dkim checks
-	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrsOriginal, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
+	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrsOriginal, bufio.NewReader(bytes.NewReader(rawBody)), true, ignoreTest, false, now, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +238,7 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	headerFrom := strings.Split(from.Address, "@")[1]
 	spfRes, dmarcPass, cv := arc.BuildAuthResults(from, mailfrom, ipfrom, dkimResults, instance, resolver)
 
+	// auth results header
 	sigsAuth, err := dkim.BuildSignatureGeneric(elog, AuthResultsSpec, hdrsForward, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
 	if err != nil {
 		return nil, err
@@ -251,6 +254,7 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	sigsAuth[0].HeaderFull.Raw = headers[0].Raw
 	signedHeaders = append(signedHeaders, headers...)
 
+	// forward signature header
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
 	sigsMS, err := dkim.BuildSignatureGeneric(elog, ForwardSignatureSpec, hdrsForward, bufio.NewReader(bytes.NewReader(rawBody)), domain, _selectors, smtputf8, now)
@@ -267,9 +271,10 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	sigsMS[0].HeaderFull.Raw = headers[0].Raw
 	signedHeaders = append(signedHeaders, headers...)
 
-	// seal
-	arcSets = append(arcSets, arc.ArcSet{Sigs: []*dkim.Sig{sigsAuth[0], sigsMS[0]}, I: instance})
-	prefixed := arc.GetChainHeaders(arcSets, instance-1)
+	// forward chain seal header
+	// fill in nil for dkim context, as it is not needed for signing the forward chain seal
+	arcSets = append(arcSets, arc.ArcSet{Sigs: []*dkim.Sig{nil, sigsAuth[0], sigsMS[0]}, I: instance})
+	prefixed := GetChainHeaders(arcSets, instance-1)
 
 	_selectors = make([]dkim.Selector, len(selectors))
 	copy(_selectors, selectors)
@@ -287,6 +292,22 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	return signedHeaders, nil
 }
 
+var DkimCtxSpec = dkim.Spec{
+	HeaderName:   HEADER_FORWARD_DKIM_CTX,
+	RequiredTags: []string{"i", HEADER_SUBJECT, HEADER_FROM, HEADER_TO, HEADER_MESSAGE_ID, HEADER_DATE, HEADER_DKIM_SIGNATURE},
+	// optional: HEADER_CC, HEADER_BCC, HEADER_REPLY_TO, HEADER_REFERENCES, HEADER_IN_REPLY_TO
+	HeaderCanonicalization: "relaxed",
+	BodyCanonicalization:   "relaxed",
+	PolicySig:              PolicyDkimCtx,
+	PolicyHeader:           PolicyHeadersDkimCtx,
+	PolicyParsing:          PolicyParsingDkimCtx,
+	CheckSignatureParams:   CheckSignatureParamsDkimCtx,
+	NewSigWithDefaults:     NewSigWithDefaultsDkimCtx,
+	BuildSignatureHeader:   BuildHeaderDkimCtx,
+	RequiredHeaders:        []dkim.HeaderInstance{},
+	ParseSignature:         ParseSignatureDkimCtx,
+}
+
 var SealSpec = dkim.Spec{
 	HeaderName:             HEADER_FORWARD_SEAL,
 	RequiredTags:           []string{"a", "b", "d", "s", "i", "cv"},
@@ -298,12 +319,12 @@ var SealSpec = dkim.Spec{
 	CheckSignatureParams:   CheckSignatureParamsArcSeal,
 	NewSigWithDefaults:     NewSigWithDefaultsArcSeal,
 	BuildSignatureHeader:   BuildHeaderAS,
-	RequiredHeaders:        []string{},
+	RequiredHeaders:        []dkim.HeaderInstance{},
 }
 
 var ForwardSignatureSpec = dkim.Spec{
 	HeaderName:             HEADER_FORWARD_SIG,
-	RequiredTags:           []string{"a", "b", "bh", "d", "h", "s", "i"},
+	RequiredTags:           []string{"a", "b", "bh", "d", "h", "s", "i", FIELD_DNS_REGISTRY, FIELD_EMAIL_REGISTRY},
 	HeaderCanonicalization: "relaxed",
 	BodyCanonicalization:   "relaxed",
 	PolicySig:              PolicyArcMS,
@@ -313,7 +334,8 @@ var ForwardSignatureSpec = dkim.Spec{
 	NewSigWithDefaults:     NewSigWithDefaultsArcMS,
 	BuildSignatureHeader:   BuildHeaderMS,
 	// ParseSignature:         ParseForwardSignature,
-	RequiredHeaders: append(strings.Split("From,To,Cc,Bcc,Reply-To,References,In-Reply-To,Subject,Date,Message-ID,Content-Type", ","), HEADER_FORWARD_DNS_REGISTRY, HEADER_FORWARD_EMAIL_REGISTRY, HEADER_FORWARD_ORIGIN_DKIM_CTX),
+	// RequiredHeaders: append(dkim.BuildHeaderInstances(strings.Split("From,To,Cc,Bcc,Reply-To,References,In-Reply-To,Subject,Date,Message-ID,Content-Type", ",")), dkim.HeaderInstance{Name: HEADER_FORWARD_DKIM_CTX, Instance: true}), //, HEADER_FORWARD_DNS_REGISTRY, HEADER_FORWARD_EMAIL_REGISTRY),
+	RequiredHeaders: []dkim.HeaderInstance{{Name: HEADER_FORWARD_DKIM_CTX, Instance: true}},
 }
 
 var AuthResultsSpec = dkim.Spec{
@@ -330,6 +352,136 @@ var AuthResultsSpec = dkim.Spec{
 	BuildSignatureHeader:   arc.AuthResultsSpec.BuildSignatureHeader,
 	RequiredHeaders:        arc.AuthResultsSpec.RequiredHeaders,
 	GetPrefixHeaders:       arc.AuthResultsSpec.GetPrefixHeaders,
+}
+
+func NewSigWithDefaultsDkimCtx() *dkim.Sig {
+	return &dkim.Sig{
+		Canonicalization: "relaxed/relaxed",
+		Length:           -1,
+		SignTime:         -1,
+		ExpireTime:       -1,
+	}
+}
+
+func PolicyDkimCtx(sig *dkim.Sig) error {
+	return nil
+}
+
+func PolicyHeadersDkimCtx(hdrs []utils.Header) error {
+	return nil
+}
+
+func PolicyParsingDkimCtx(ds *dkim.Sig, p *dkim.Parser, fieldName string) (bool, error) {
+	switch fieldName {
+	case "i":
+		ds.Instance = int32(p.XNumber(2))
+		return true, nil
+	}
+	return false, nil
+}
+
+func CheckSignatureParamsDkimCtx(sig *dkim.Sig) error {
+	return nil
+}
+
+func BuildHeaderDkimCtx(s *dkim.Sig) (string, error) {
+	// expect added headers in .Tags
+	w := &message.HeaderWriter{}
+	w.Addf("", "%s: i=%d;", s.HeaderFull.Key, s.Instance)
+
+	for _, tag := range s.Tags {
+		for _, field := range tag {
+			w.Addf(" ", "%s=%s;", field.Key, field.Value)
+		}
+	}
+
+	w.Add("\r\n")
+	return w.String(), nil
+}
+
+func ParseSignatureDkimCtx(
+	header *utils.Header,
+	smtputf8 bool,
+	required []string,
+	parsingPolicy func(ds *dkim.Sig, p *dkim.Parser, fieldName string) (bool, error),
+	newSig func() *dkim.Sig,
+) (sig *dkim.Sig, err error) {
+	defer func() {
+		if x := recover(); x != nil {
+			if xerr, ok := x.(error); ok {
+				sig = nil
+				err = xerr
+			} else {
+				panic(x)
+			}
+		}
+	}()
+
+	buf := header.Raw
+	if !bytes.HasSuffix(buf, []byte("\r\n")) {
+		return nil, dkim.ErrSigMissingCRLF
+	}
+	buf = buf[:len(buf)-2]
+
+	ds := newSig()
+	ds.HeaderFull = header
+	seen := map[string]struct{}{}
+	p := dkim.NewParser(string(buf), smtputf8)
+
+	// Parse field name
+	name := p.XHdrName(false)
+	if !strings.EqualFold(name, header.Key) {
+		return nil, dkim.ErrSigHeader
+	}
+	p.Wsp()
+	p.XTake(":")
+	p.Wsp()
+
+	// Parse semicolon-separated fields
+	for !p.Empty() {
+		p.Fws()
+
+		// Skip empty “;” between folded lines
+		for p.HasPrefix(";") {
+			p.XTake(";")
+			p.Fws()
+		}
+		if p.Empty() {
+			break
+		}
+
+		// tagName := p.XTagName()
+		tagName := p.DottedName(false) // Allows "Message-ID", "List-Unsubscribe", etc.
+		p.Fws()
+		p.XTake("=")
+		p.Fws()
+
+		// Special parsing for known types
+		switch tagName {
+		case "i":
+			inst := int(p.XNumber(3))
+			if inst <= 0 {
+				return nil, fmt.Errorf("dkim: invalid instance i=%d", inst)
+			}
+			ds.Instance = int32(inst)
+			seen["i"] = struct{}{}
+		default:
+			// Handle non-standard tags like Date, From, etc.
+			value := p.XRawUntil(";")
+			ds.Tags = append(ds.Tags, []dkim.Tag{{Key: tagName, Value: value}})
+			seen[tagName] = struct{}{}
+		}
+	}
+
+	// Check for required fields
+	for _, req := range required {
+		if _, ok := seen[req]; !ok {
+			return nil, fmt.Errorf("%w: %q", dkim.ErrSigMissingTag, req)
+		}
+	}
+
+	ds.VerifySig = []byte(p.GetTracked())
+	return ds, nil
 }
 
 func NewSigWithDefaultsArcSeal() *dkim.Sig {
@@ -474,6 +626,7 @@ func BuildForwardHeaders(
 	bcc []*mail.Address,
 	subjectAddl string,
 	timestamp time.Time,
+	messageId string,
 ) ([]utils.Header, error) {
 	arcSets, err := arc.ExtractSignatureSets(hdrs, HEADER_NAMES, SPECS, smtputf8)
 	if err != nil {
@@ -481,7 +634,7 @@ func BuildForwardHeaders(
 	}
 	instance := len(arcSets) + 1
 
-	hdrs = BuildForwardHeadersInternal(elog, originalEmail, hdrs, from, to, cc, bcc, subjectAddl, timestamp, instance)
+	hdrs = BuildForwardHeadersInternal(elog, originalEmail, hdrs, from, to, cc, bcc, subjectAddl, timestamp, messageId, instance)
 	return hdrs, nil
 }
 
@@ -495,6 +648,7 @@ func BuildForwardHeadersInternal(
 	bcc []*mail.Address,
 	subjectAddl string,
 	timestamp time.Time,
+	newmessageId string,
 	instance int,
 ) []utils.Header {
 	// changed headers
@@ -508,9 +662,9 @@ func BuildForwardHeadersInternal(
 		HEADER_SUBJECT,
 		HEADER_REFERENCES,
 		HEADER_IN_REPLY_TO,
+		HEADER_DKIM_SIGNATURE,
 	}
 
-	// addedHeaders := updatedHeaders
 	messageId := ""
 	dkimCtxParams := make(map[string]string, 0)
 	hdrs2 := make([]utils.Header, 0)
@@ -520,10 +674,14 @@ func BuildForwardHeadersInternal(
 		switch strings.ToLower(h.Key) {
 		case HEADER_LOW_MESSAGE_ID:
 			messageId = h.GetValueTrimmed() // with <>
-			dkimCtxParams[HEADER_LOW_MESSAGE_ID] = messageId
-		default:
-			hdrs2 = append(hdrs2, h)
+			dkimCtxParams[HEADER_MESSAGE_ID] = messageId
+			h = utils.Header{
+				Key:   HEADER_MESSAGE_ID,
+				Value: []byte(fmt.Sprintf(" <%s>\r\n", newmessageId)),
+			}
+			h.RebuildRaw()
 		}
+		hdrs2 = append(hdrs2, h)
 	}
 
 	// we replace these headers
@@ -557,8 +715,14 @@ func BuildForwardHeadersInternal(
 		}
 
 		if slices.Contains(updatedHeaders, h.Key) {
-			if _, ok := dkimCtxParams[h.LKey]; !ok {
-				dkimCtxParams[h.LKey] = originalValue
+			if _, ok := dkimCtxParams[h.Key]; !ok {
+				dkimCtxParams[h.Key] = originalValue
+				switch h.LKey {
+				case HEADER_LOW_SUBJECT:
+					dkimCtxParams[h.Key] = url.QueryEscape(dkimCtxParams[h.Key])
+				case HEADER_LOW_DKIM_SIGNATURE:
+					dkimCtxParams[h.Key] = base64.StdEncoding.EncodeToString([]byte(dkimCtxParams[h.Key]))
+				}
 			}
 		}
 
@@ -581,8 +745,8 @@ func BuildDkimContextParams(dkimCtxParams map[string]string, instance int) utils
 	})
 
 	h := utils.Header{
-		Key:   HEADER_FORWARD_ORIGIN_DKIM_CTX,
-		LKey:  strings.ToLower(HEADER_FORWARD_ORIGIN_DKIM_CTX),
+		Key:   HEADER_FORWARD_DKIM_CTX,
+		LKey:  strings.ToLower(HEADER_FORWARD_DKIM_CTX),
 		Value: []byte(w.String()),
 	}
 	h.RebuildRaw()
@@ -595,4 +759,202 @@ func SerializeAddresses(addresses []*mail.Address) string {
 		addrs[i] = addr.String()
 	}
 	return strings.Join(addrs, ", ")
+}
+
+func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []utils.Header, rawBody []byte, headerNames []string, specs []dkim.Spec, smtputf8 bool, ignoreTest bool, now func() time.Time, rec *dkim.Record) (dkim.Status, [][]dkim.Result, error) {
+	arcSets, err := arc.ExtractSignatureSets(hdrs, headerNames, specs, smtputf8)
+	if err != nil {
+		return dkim.StatusFail, nil, err
+	}
+
+	//	"The maximum number of ARC Sets that can be attached to a
+	//	message is 50.  If more than the maximum number exist, the
+	//	Chain Validation Status is "fail..."
+	l := len(arcSets)
+	switch {
+	case l == 0:
+		return dkim.StatusNone, nil, ErrMsgNotSigned
+	case l > 50:
+		return dkim.StatusFail, nil, ErrArcLimit
+	}
+
+	var results [][]dkim.Result
+	for i, set := range arcSets {
+		ress := make([]dkim.Result, 0)
+		for x, sig := range set.Sigs {
+			spec := specs[x]
+			if x == ChainNdx {
+				// arc seal
+				spec.GetPrefixHeaders = func() []utils.Header { return GetChainHeaders(arcSets, i) }
+			}
+			res := dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), sig, ignoreTest, true, now, rec)
+			ress = append(ress, res)
+		}
+		// rebuild previous email context needed for DKIM signature and forward signature
+		origHeaders, err := RebuildDkim(ress[0].Sig.Tags, hdrs, set.I)
+		if err != nil {
+			return dkim.StatusFail, nil, err
+		}
+
+		// // process dkim context first, to reconstruct original headers
+		// res := dkim.VerifySignatureGeneric(elog, specs[DkimCtxNdx], resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), set.Sigs[DkimCtxNdx], ignoreTest, true, now, rec)
+		// ress = append(ress, res)
+
+		// // rebuild previous email context needed for DKIM signature and forward signature
+		// origHeaders, err := RebuildDkim(ress[0].Sig.Tags, hdrs, set.I)
+		// if err != nil {
+		// 	return dkim.StatusFail, nil, err
+		// }
+
+		// // auth results
+		// res = dkim.VerifySignatureGeneric(elog, specs[AuthNdx], resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), set.Sigs[AuthNdx], ignoreTest, true, now, rec)
+		// ress = append(ress, res)
+
+		// // forward signature
+		// res = dkim.VerifySignatureGeneric(elog, specs[SigNdx], resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), set.Sigs[SigNdx], ignoreTest, true, now, rec)
+		// ress = append(ress, res)
+
+		// // chain seal signature
+		// spec := specs[ChainNdx]
+		// spec.GetPrefixHeaders = func() []utils.Header { return GetChainHeaders(arcSets, i) }
+		// res = dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), set.Sigs[ChainNdx], ignoreTest, true, now, rec)
+		// ress = append(ress, res)
+
+		// previous email's original DKIM signature
+		resp, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, origHeaders, bufio.NewReader(bytes.NewReader(rawBody)), true, ignoreTest, false, now, nil)
+		if err != nil {
+			return dkim.StatusFail, nil, err
+		}
+		ress = append(ress, resp[0])
+
+		results = append(results, ress)
+	}
+
+	return dkim.StatusPass, results, nil
+}
+
+func RebuildDkim(tags [][]dkim.Tag, hdrs []utils.Header, instance int) ([]utils.Header, error) {
+	vals := map[string]string{}
+	var err error
+
+	// Extract all original header values from DKIM context tags
+	for _, tag := range tags {
+		for _, t := range tag {
+			k := strings.ToLower(t.Key)
+			vals[k] = t.Value
+			switch k {
+			case HEADER_LOW_SUBJECT:
+				vals[k], err = url.QueryUnescape(vals[k])
+				if err != nil {
+					return nil, err
+				}
+			case HEADER_LOW_DKIM_SIGNATURE:
+				v, err := base64.StdEncoding.DecodeString(vals[k])
+				if err != nil {
+					return nil, err
+				}
+				vals[k] = string(v)
+			}
+			// add initial space
+			vals[k] = " " + vals[k]
+			// add end of line for headers
+			vals[k] += utils.CRLF
+		}
+	}
+
+	// Find the index of the first Provable-Forward-* header with the given instance
+	cutoffIndex := len(hdrs) // Default to keeping all headers if no forward headers found
+	for i := len(hdrs) - 1; i >= 0; i-- {
+		h := hdrs[i]
+		if strings.HasPrefix(h.Key, HEADER_FORWARD_PREFIX) {
+			headerInstance := extractInstanceFromHeader(h)
+			if headerInstance == instance {
+				cutoffIndex = i + 1
+				break
+			}
+		}
+	}
+	if cutoffIndex < 0 {
+		return nil, fmt.Errorf("provable- header cannot be first")
+	}
+
+	// Keep headers up to the cutoff index
+	newlen := len(hdrs) - cutoffIndex
+	rebuiltHeaders := make([]utils.Header, newlen)
+	copy(rebuiltHeaders, hdrs[cutoffIndex:])
+
+	added := map[string]bool{}
+	// Replace header values with original values from DKIM context tags
+	for i, h := range rebuiltHeaders {
+		if val, ok := vals[h.LKey]; ok {
+			rebuiltHeaders[i].Value = []byte(val)
+			rebuiltHeaders[i].RebuildRaw()
+			added[h.LKey] = true
+		}
+	}
+
+	// add original tags that are missing
+	for _, tag := range tags {
+		for _, t := range tag {
+			k := strings.ToLower(t.Key)
+			if _, ok := added[k]; !ok {
+				value := vals[k]
+				h := utils.Header{
+					Key:   t.Key,
+					LKey:  k,
+					Value: []byte(value),
+				}
+				h.RebuildRaw()
+				rebuiltHeaders = append([]utils.Header{h}, rebuiltHeaders...)
+			}
+		}
+	}
+
+	// // Add the original DKIM signature header if available
+	// if dkimSig, ok := vals[HEADER_LOW_DKIM_SIGNATURE]; ok && !replacedDKIM {
+	// 	dkimHeader := utils.Header{
+	// 		Key:   HEADER_DKIM_SIGNATURE,
+	// 		LKey:  HEADER_LOW_DKIM_SIGNATURE,
+	// 		Value: []byte(dkimSig),
+	// 	}
+	// 	dkimHeader.RebuildRaw()
+	// 	rebuiltHeaders = append([]utils.Header{dkimHeader}, rebuiltHeaders...)
+	// }
+
+	return rebuiltHeaders, nil
+}
+
+// Helper function to extract instance number from Provable-Forward-* headers
+func extractInstanceFromHeader(h utils.Header) int {
+	// Parse the header value to extract i= parameter
+	value := strings.TrimSpace(string(h.Value))
+	if strings.HasPrefix(value, "i=") {
+		parts := strings.Split(value, ";")
+		if len(parts) > 0 {
+			iPart := strings.TrimSpace(parts[0])
+			if strings.HasPrefix(iPart, "i=") {
+				if instance, err := strconv.Atoi(iPart[2:]); err == nil {
+					return instance
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func GetChainHeaders(arcSets []arc.ArcSet, index int) []utils.Header {
+	var res []utils.Header
+	for _, arcSet := range arcSets {
+		res = append(res,
+			*arcSet.Sigs[AuthNdx].HeaderFull, // authResults
+			*arcSet.Sigs[SigNdx].HeaderFull,  // message signature
+		)
+
+		if arcSet.Sigs[SigNdx].Instance == int32(index+1) {
+			break
+		}
+		// skip last seal as it's not in the signature
+		res = append(res, *arcSet.Sigs[ChainNdx].HeaderFull)
+	}
+	return res
 }

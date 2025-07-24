@@ -70,11 +70,13 @@ var (
 	SPECS        = []dkim.Spec{AuthResultsSpec, ArcMessageSignatureSpec, ArcSealSpec}
 )
 
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, bodybz []byte, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
+	r := bytes.NewReader(bodybz)
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
+	r = bytes.NewReader(bodybz)
 	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
 	if err != nil {
 		return nil, err
@@ -84,7 +86,7 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 		return &ArcResult{Result: dkim.Result{Status: dkim.StatusNone}}, nil
 	}
 
-	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), HEADER_NAMES, SPECS, smtputf8, ignoreTest, now, rec)
+	status, results, err := VerifySignaturesBasic(elog, resolver, hdrs, rawBody, HEADER_NAMES, SPECS, smtputf8, ignoreTest, now, rec)
 	if err != nil {
 		return &ArcResult{Result: dkim.Result{Status: status, Err: err}}, nil
 	}
@@ -154,13 +156,15 @@ func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.Reader
 	return &ArcResult{Result: dkim.Result{Status: dkim.StatusPass}, Chain: chain}, nil
 }
 
-func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, msg io.ReaderAt, mailfrom string, ipfrom string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
+func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors []dkim.Selector, smtputf8 bool, bodybz []byte, mailfrom string, ipfrom string, ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record) ([]utils.Header, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
-	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+	r := bytes.NewReader(bodybz)
+	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
-	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: msg, Offset: int64(bodyOffset)}))
+	r = bytes.NewReader(bodybz)
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +185,7 @@ func Sign(elog *slog.Logger, resolver dns.Resolver, domain dns.Domain, selectors
 	copy(_selectors, selectors)
 
 	// dkim checks
-	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), ignoreTest, strictExpiration, now, rec)
+	dkimResults, err := dkim.Verify(elog, resolver, smtputf8, dkim.DKIMSpec.PolicySig, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), true, ignoreTest, strictExpiration, now, rec)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +258,7 @@ var ArcSealSpec = dkim.Spec{
 	CheckSignatureParams:   CheckSignatureParamsArcSeal,
 	NewSigWithDefaults:     NewSigWithDefaultsArcSeal,
 	BuildSignatureHeader:   BuildHeaderAS,
-	RequiredHeaders:        []string{},
+	RequiredHeaders:        []dkim.HeaderInstance{},
 }
 
 var ArcMessageSignatureSpec = dkim.Spec{
@@ -268,7 +272,7 @@ var ArcMessageSignatureSpec = dkim.Spec{
 	CheckSignatureParams:   CheckSignatureParamsArcMS,
 	NewSigWithDefaults:     NewSigWithDefaultsArcMS,
 	BuildSignatureHeader:   BuildHeaderMS,
-	RequiredHeaders:        strings.Split("From,To,Cc,Bcc,Reply-To,References,In-Reply-To,Subject,Date,Message-ID,Content-Type", ","),
+	RequiredHeaders:        dkim.BuildHeaderInstances(strings.Split("From,To,Cc,Bcc,Reply-To,References,In-Reply-To,Subject,Date,Message-ID,Content-Type", ",")),
 }
 
 var AuthResultsSpec = dkim.Spec{
@@ -283,7 +287,7 @@ var AuthResultsSpec = dkim.Spec{
 	NewSigWithDefaults:     NewSigWithDefaultsArcAuth,
 	ParseSignature:         ParseSignatureAuthResults,
 	BuildSignatureHeader:   BuildHeaderAuth,
-	RequiredHeaders:        []string{},
+	RequiredHeaders:        []dkim.HeaderInstance{},
 }
 
 func NewSigWithDefaultsArcSeal() *dkim.Sig {
@@ -402,7 +406,7 @@ func GetChainHeaders(arcSets []ArcSet, i int) []utils.Header {
 	return res
 }
 
-func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []utils.Header, bodyReader io.Reader, headerNames []string, specs []dkim.Spec, smtputf8 bool, ignoreTest bool, now func() time.Time, rec *dkim.Record) (dkim.Status, [][]dkim.Result, error) {
+func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []utils.Header, rawBody []byte, headerNames []string, specs []dkim.Spec, smtputf8 bool, ignoreTest bool, now func() time.Time, rec *dkim.Record) (dkim.Status, [][]dkim.Result, error) {
 	arcSets, err := ExtractSignatureSets(hdrs, headerNames, specs, smtputf8)
 	if err != nil {
 		return dkim.StatusFail, nil, err
@@ -429,7 +433,7 @@ func VerifySignaturesBasic(elog *slog.Logger, resolver dns.Resolver, hdrs []util
 				// arc seal
 				spec.GetPrefixHeaders = func() []utils.Header { return GetChainHeaders(arcSets, i) }
 			}
-			res := dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bodyReader, sig, ignoreTest, true, now, rec)
+			res := dkim.VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bufio.NewReader(bytes.NewReader(rawBody)), sig, ignoreTest, true, now, rec)
 			ress = append(ress, res)
 		}
 		results = append(results, ress)
@@ -775,7 +779,6 @@ func BuildAuthResults(from *mail.Address, mailfrom string, ipfrom string, dkimRe
 	dmarcPass = false
 	dmarcRecord, err := dmarc.LookupWithOptions(headerFrom, resolver.LookupTXT)
 	if err != nil {
-		fmt.Println("DMARC failed:", err)
 		dmarcPass = false
 	} else {
 		dmarcPass, dkimpass = dmarc.CheckDMARC(headerFrom, dmarcRecord, spfRes, dkimRes, dkimpass)

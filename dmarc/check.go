@@ -1,6 +1,8 @@
 package dmarc
 
-import "strings"
+import (
+	"strings"
+)
 
 // 1. Check DKIM: Was there a valid DKIM signature from example.com?
 // 2. Check SPF: Did SPF pass for the envelope sender domain?

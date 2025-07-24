@@ -2,7 +2,6 @@ package dmarc
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"strings"
 
@@ -26,8 +25,6 @@ func CheckSPF(domain string, ip string, lookupTxt TxtLookupFunc) (AuthResult, er
 		return AuthResult{Domain: domain, Valid: false}, err
 	}
 
-	fmt.Println("--CheckSPF--", txts)
-
 	var spfRecord string
 	for _, txt := range txts {
 		if strings.HasPrefix(txt, "v=spf1 ") {
@@ -39,8 +36,6 @@ func CheckSPF(domain string, ip string, lookupTxt TxtLookupFunc) (AuthResult, er
 	if spfRecord == "" {
 		return AuthResult{Domain: domain, Valid: false}, errors.New("no SPF record found")
 	}
-
-	fmt.Println("--spfRecord--", spfRecord)
 
 	ipAddr := net.ParseIP(ip)
 	if ipAddr == nil {

@@ -24,11 +24,16 @@ import (
 	utils "github.com/loredanacirstea/mailverif/utils"
 )
 
+type HeaderInstance struct {
+	Name     string
+	Instance bool // use instance value, if exists
+}
+
 // Spec describes one signed-header scheme (DKIM, ARC-Message-Signature, …).
 type Spec struct {
 	HeaderName             string   // e.g. "DKIM-Signature"
 	RequiredTags           []string // e.g. []{"b","bh","a","d","h","s"}
-	RequiredHeaders        []string
+	RequiredHeaders        []HeaderInstance
 	HeaderCanonicalization string // "", "simple", "relaxed"
 	BodyCanonicalization   string // "", "simple", "relaxed"
 	// Called once the generic DKIM mechanics have checked the cryptographic
@@ -461,10 +466,14 @@ func ParseSignature(
 }
 
 func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bodyReader io.Reader, domain dns.Domain, selectors []Selector, smtputf8 bool, timeNow func() time.Time) (sigs []*Sig, rerr error) {
+	data, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil, err
+	}
 	for i, s := range selectors {
 		selectors[i] = ApplySpecToSelector(&spec, s)
 	}
-	err := spec.PolicyHeader(hdrs)
+	err = spec.PolicyHeader(hdrs)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +548,7 @@ func BuildSignatureGeneric(elog *slog.Logger, spec Spec, hdrs []utils.Header, bo
 		if bh, ok := bodyHashes[hk]; ok {
 			sig.BodyHash = bh
 		} else {
-			br := bufio.NewReader(bodyReader)
+			br := bufio.NewReader(bytes.NewReader(data))
 			bh, err = BodyHash(h.New(), !sel.BodyRelaxed, br)
 			if err != nil {
 				return nil, err
@@ -571,7 +580,7 @@ func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []ut
 		verifySig := []byte(strings.TrimSuffix(sigh, "\r\n"))
 		sig.VerifySig = verifySig
 
-		dh, err := DataHash(h.New(), !sig.SelectorFull.HeaderRelaxed, sig, hdrs, prefixHeaders)
+		dh, err := DataHash(h.New(), !sig.SelectorFull.HeaderRelaxed, sig, hdrs, prefixHeaders, spec.RequiredHeaders)
 		if err != nil {
 			return nil, err
 		}
@@ -615,8 +624,13 @@ func SignGeneric(spec Spec, sigs []*Sig, hdrs []utils.Header, prefixHeaders []ut
 // 5. Generic Verify ----------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyReader io.Reader, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
-	err := spec.PolicyHeader(hdrs)
+func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8 bool, hdrs []utils.Header, bodyReader io.Reader, onlyLast bool, ignoreTest, strictExp bool, now func() time.Time, rec *Record) ([]Result, error) {
+	data, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil, err
+	}
+
+	err = spec.PolicyHeader(hdrs)
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +638,6 @@ func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8
 	targetKey := strings.ToLower(spec.HeaderName)
 
 	var results []Result
-
 	for _, h := range hdrs {
 		if h.LKey != targetKey {
 			continue
@@ -637,11 +650,17 @@ func VerifyGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver, smtputf8
 		sig, err := parseSig(&h, smtputf8, spec.RequiredTags, spec.PolicyParsing, spec.NewSigWithDefaults)
 		if err != nil {
 			results = append(results, Result{StatusPermerror, nil, nil, false, false, err, 0})
+			if onlyLast {
+				break
+			}
 			continue
 		}
 
-		res := VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bodyReader, sig, ignoreTest, strictExp, now, rec)
+		res := VerifySignatureGeneric(elog, spec, resolver, smtputf8, hdrs, bytes.NewReader(data), sig, ignoreTest, strictExp, now, rec)
 		results = append(results, res)
+		if onlyLast {
+			break
+		}
 	}
 	return results, nil
 }
@@ -670,7 +689,7 @@ func VerifySignatureGeneric(elog *slog.Logger, spec Spec, resolver dns.Resolver,
 	if spec.GetPrefixHeaders != nil {
 		prefixHeaders = spec.GetPrefixHeaders()
 	}
-	status, txt, authentic, err := VerifySignature(elog, resolver, sig, hashAlg, canonHdrSimple, canonBodySimple, hdrs, prefixHeaders, br, ignoreTest, rec)
+	status, txt, authentic, err := VerifySignature(elog, resolver, sig, hashAlg, canonHdrSimple, canonBodySimple, hdrs, prefixHeaders, spec.RequiredHeaders, br, ignoreTest, rec)
 	return Result{status, sig, txt, authentic, expired, err, 0}
 }
 
@@ -758,8 +777,39 @@ func ApplySpecToSelector(spec *Spec, sel Selector) Selector {
 	if spec.BodyCanonicalization != "" {
 		sel.BodyRelaxed = spec.BodyCanonicalization == "relaxed"
 	}
-	if len(spec.RequiredHeaders) > 0 {
-		sel.Headers = spec.RequiredHeaders
+	// ensure at least the required headers are included
+	hh := []string{}
+	for _, h := range spec.RequiredHeaders {
+		hh = append(hh, h.Name)
 	}
+	// TODO better
+	if len(sel.Headers) == 0 {
+		sel.Headers = hh
+	}
+	if len(spec.RequiredHeaders) > 0 {
+		sel.Headers = uniqueCombined(sel.Headers, hh)
+	}
+	// sel.Headers = hh
 	return sel
+}
+
+func uniqueCombined(a, b []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, val := range append(a, b...) {
+		if !seen[val] {
+			seen[val] = true
+			result = append(result, val)
+		}
+	}
+	return result
+}
+
+func BuildHeaderInstances(headers []string) []HeaderInstance {
+	v := make([]HeaderInstance, len(headers))
+	for i, h := range headers {
+		v[i] = HeaderInstance{Name: h, Instance: false}
+	}
+	return v
 }
