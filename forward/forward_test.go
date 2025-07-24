@@ -97,7 +97,6 @@ func TestSignForward(t *testing.T) {
 
 	// compute new email
 	initialEmail = utils.SerializeHeaders(dkimH) + initialEmail
-	r := strings.NewReader(initialEmail)
 
 	from := &mail.Address{Name: "My Name", Address: "myaddress@football.example.com"}
 	to := []*mail.Address{{Name: "Some Name", Address: "someaddress@football.example.com"}}
@@ -113,7 +112,7 @@ func TestSignForward(t *testing.T) {
 	require.Equal(t, dkim.StatusPass, resultsDkim[0].Status)
 
 	// prepare forwarded email & add forward headers
-	header, br, err := Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	header, br, err := Forward(logger, resolver, domain, selectors, false, []byte(initialEmail), mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err := io.ReadAll(br)
@@ -127,8 +126,7 @@ func TestSignForward(t *testing.T) {
 	// compute new email
 	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
-	msgr := strings.NewReader(newemail)
-	results, err := Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	results, err := Verify(logger, resolver, false, []byte(newemail), false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
@@ -151,8 +149,7 @@ func TestSignForward(t *testing.T) {
 	subjectAddl = "additional subject2"
 	timestamp = time.Date(2025, time.July, 11, 10, 3, 0, 0, time.UTC)
 	// prepare forwarded email & add forward headers
-	r = strings.NewReader(newemail)
-	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, []byte(newemail), mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err = io.ReadAll(br)
@@ -164,8 +161,7 @@ func TestSignForward(t *testing.T) {
 	header = append(dkimHeaders, header...)
 	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
-	msgr = strings.NewReader(newemail)
-	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	results, err = Verify(logger, resolver, false, []byte(newemail), false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)
@@ -192,8 +188,7 @@ func TestSignForward(t *testing.T) {
 	subjectAddl = "additional subject3"
 	timestamp = time.Date(2025, time.July, 12, 10, 3, 0, 0, time.UTC)
 	// prepare forwarded email & add forward headers
-	r = strings.NewReader(newemail)
-	header, br, err = Forward(logger, resolver, domain, selectors, false, r, mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
+	header, br, err = Forward(logger, resolver, domain, selectors, false, []byte(newemail), mailfrom, ipfrom, from, to, nil, nil, subjectAddl, timestamp, generateMessageId(), false, true, timeNow, record)
 	require.NoError(t, err)
 
 	bodyBytes, err = io.ReadAll(br)
@@ -206,8 +201,7 @@ func TestSignForward(t *testing.T) {
 
 	newemail = utils.SerializeHeaders(header) + "\r\n" + string(bodyBytes)
 
-	msgr = strings.NewReader(newemail)
-	results, err = Verify(logger, resolver, false, msgr, false, true, timeNow, record)
+	results, err = Verify(logger, resolver, false, []byte(newemail), false, true, timeNow, record)
 	require.NoError(t, err)
 	require.NoError(t, results.Result.Err)
 	require.Equal(t, dkim.StatusPass, results.Result.Status)

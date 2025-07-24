@@ -84,11 +84,13 @@ var (
 	DkimSourceNdx = 4
 )
 
-func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, r io.ReaderAt, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
+func Verify(elog *slog.Logger, resolver dns.Resolver, smtputf8 bool, bodybz []byte, ignoreTest, strictExpiration bool, now func() time.Time, rec *dkim.Record) (*ArcResult, error) {
+	r := bytes.NewReader(bodybz)
 	hdrs, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
+	r = bytes.NewReader(bodybz)
 	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
 	if err != nil {
 		return nil, err
@@ -171,22 +173,25 @@ func Forward(
 	elog *slog.Logger, resolver dns.Resolver,
 	domain dns.Domain, selectors []dkim.Selector,
 	smtputf8 bool,
-	msg io.ReaderAt,
+	bodybz []byte,
 	mailfrom string, ipfrom string,
 	from *mail.Address, to []*mail.Address, cc []*mail.Address, bcc []*mail.Address,
 	subject string, timestamp time.Time, messageId string,
 	ignoreTest bool, strictExpiration bool, now func() time.Time, rec *dkim.Record,
 ) ([]utils.Header, io.Reader, error) {
 	// envelope sender or MAIL FROM address, is set by the email client or server initiating the SMTP transaction
-	hdrsOriginal, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: msg}))
+	r := bytes.NewReader(bodybz)
+	hdrsOriginal, bodyOffset, err := utils.ParseHeaders(bufio.NewReader(&moxio.AtReader{R: r}))
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %s", dkim.ErrHeaderMalformed, err)
 	}
-	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: msg, Offset: int64(bodyOffset)}))
+	r = bytes.NewReader(bodybz)
+	rawBody, err := io.ReadAll(bufio.NewReader(&moxio.AtReader{R: r, Offset: int64(bodyOffset)}))
 	if err != nil {
 		return nil, nil, err
 	}
-	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, msg, hdrsOriginal, from, to, cc, bcc, subject, timestamp, messageId)
+	r = bytes.NewReader(bodybz)
+	hdrsForward, err := BuildForwardHeaders(elog, smtputf8, r, hdrsOriginal, from, to, cc, bcc, subject, timestamp, messageId)
 	if err != nil {
 		return nil, nil, err
 	}
