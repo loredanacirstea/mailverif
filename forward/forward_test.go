@@ -75,7 +75,7 @@ func TestSignForward(t *testing.T) {
 			"_dmarc.football.example.com": {"v=DMARC1;p=reject;rua=mailto:dmarc-reports@football.example.com!10m"},
 
 			// SPF
-			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s/32 -all", ipfrom)},
+			"football.example.com": {fmt.Sprintf("v=spf1 ip4:%s -all", ipfrom)},
 
 			// DKIM
 			"brisbane._domainkey.football.example.com.": {txtOrig},

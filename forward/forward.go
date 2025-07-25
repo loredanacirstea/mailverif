@@ -29,6 +29,7 @@ const (
 	HEADER_FORWARD_DKIM_CTX = "Provable-Forward-DKIM-Context"
 	HEADER_FORWARD_SIG      = "Provable-Forward-Signature"
 	HEADER_FORWARD_SEAL     = "Provable-Forward-Seal"
+	HEADER_FORWARD_CHECK    = "Provable-Forward-Check"
 )
 
 var (

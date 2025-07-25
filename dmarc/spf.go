@@ -49,6 +49,9 @@ func CheckSPF(domain string, ip string, lookupTxt TxtLookupFunc) (AuthResult, er
 
 		if strings.HasPrefix(mech, "ip4:") && ipAddr.To4() != nil {
 			cidr := strings.TrimPrefix(mech, "ip4:")
+			if !strings.Contains(cidr, "/") {
+				cidr += "/32" // default for ip4: only this IP is valid
+			}
 			if _, ipnet, err := net.ParseCIDR(cidr); err == nil && ipnet.Contains(ipAddr) {
 				return AuthResult{Domain: domain, Valid: true}, nil
 			}
@@ -56,6 +59,9 @@ func CheckSPF(domain string, ip string, lookupTxt TxtLookupFunc) (AuthResult, er
 
 		if strings.HasPrefix(mech, "ip6:") && ipAddr.To16() != nil && ipAddr.To4() == nil {
 			cidr := strings.TrimPrefix(mech, "ip6:")
+			if !strings.Contains(cidr, "/") {
+				cidr += "/128" // default for ip6: only this IP is valid
+			}
 			if _, ipnet, err := net.ParseCIDR(cidr); err == nil && ipnet.Contains(ipAddr) {
 				return AuthResult{Domain: domain, Valid: true}, nil
 			}
